@@ -1,0 +1,65 @@
+[
+ {
+  "index": 0,
+  "korean": "Junbi",
+  "english": "Ready stance",
+  "file": "ready-stance",
+  "classId": "ready"
+ },
+ {
+  "index": 1,
+  "korean": "Ap chagi",
+  "english": "Front kick",
+  "file": "front-kick",
+  "classId": "front_kick"
+ },
+ {
+  "index": 2,
+  "korean": "Dollyo chagi",
+  "english": "Roundhouse kick",
+  "file": "roundhouse-kick",
+  "classId": "roundhouse"
+ },
+ {
+  "index": 3,
+  "korean": "Yeop chagi",
+  "english": "Side kick",
+  "file": "side-kick",
+  "classId": "side_kick"
+ },
+ {
+  "index": 4,
+  "korean": "Dwit chagi",
+  "english": "Back kick",
+  "file": "back-kick",
+  "classId": "back_kick"
+ },
+ {
+  "index": 5,
+  "korean": "Naeryeo chagi",
+  "english": "Axe kick",
+  "file": "axe-kick",
+  "classId": "axe_kick"
+ },
+ {
+  "index": 6,
+  "korean": "Arae makki",
+  "english": "Low block",
+  "file": "low-block",
+  "classId": "low_block"
+ },
+ {
+  "index": 7,
+  "korean": "Olgul makki",
+  "english": "High block",
+  "file": "high-block",
+  "classId": "high_block"
+ },
+ {
+  "index": 8,
+  "korean": "Jireugi",
+  "english": "Middle punch",
+  "file": "punch",
+  "classId": "punch"
+ }
+]
