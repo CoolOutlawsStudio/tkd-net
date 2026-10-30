@@ -162,7 +162,7 @@
   }
 
   function schedule() {
-    if (S.timer !== null) return;
+    if (S.timer !== null) { clearTimeout(S.timer); S.timer = null; } // drop a stale slice from before pause/reset
     var g = S.gen;
     S.timer = setTimeout(function () { S.timer = null; if (g === S.gen) slice(); }, 0);
   }
