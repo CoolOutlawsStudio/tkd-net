@@ -1,1 +1,376 @@
-<!doctype html><meta charset="utf-8"><title>TKD-Net</title><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#0b0d12;color:#e8eaf0;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0"><h1>TKD-Net: coming soon</h1></body>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0c0b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TKD-Net">
+<title>TKD-Net · taekwondo technique trainer</title>
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/theme.css">
+<link rel="stylesheet" href="style.css">
+<script>
+/* ===== Contract adapter (CONTRACT.md v1) ===================================================
+   The ONLY place that knows the worker's message protocol. Everything below the adapter
+   consumes the normalised callbacks. Page -> worker: start | pause | resume | reset | predict | export.
+   Worker -> page: ready | status | progress | eval | saved | prediction | weights | error.
+   Add ?demo to the URL to drive the UI from a local simulator instead of train-worker.js. */
+(function () {
+  var TKD = window.TKD = window.TKD || {};
+  // Contract constants (owned by nn.js, which runs in the worker; mirrored here for the page).
+  if (!TKD.CLASSES) TKD.CLASSES = ['ready','front_kick','roundhouse','side_kick','back_kick','axe_kick','low_block','high_block','punch'];
+  if (!TKD.NCLASSES) TKD.NCLASSES = 9;
+  if (!TKD.FRAMES) TKD.FRAMES = 16;
+  if (!TKD.FEATURES) TKD.FEATURES = 34;
+  // Class id -> art file name in assets/icons and assets/skeletons (art uses hyphenated ids).
+  TKD.ART = { ready:'ready-stance', front_kick:'front-kick', roundhouse:'roundhouse-kick', side_kick:'side-kick',
+    back_kick:'back-kick', axe_kick:'axe-kick', low_block:'low-block', high_block:'high-block', punch:'punch' };
+  TKD.LABELS = { ready:['Junbi','Ready stance'], front_kick:['Ap chagi','Front kick'], roundhouse:['Dollyo chagi','Roundhouse kick'],
+    side_kick:['Yeop chagi','Side kick'], back_kick:['Dwit chagi','Back kick'], axe_kick:['Naeryeo chagi','Axe kick'],
+    low_block:['Arae makki','Low block'], high_block:['Olgul makki','High block'], punch:['Jireugi','Middle punch'] };
+
+  var handlers = {};
+  var bridge = TKD.bridge = {
+    worker: null, mode: 'none',
+    on: function (type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
+    emit: function (msg) { var l = handlers[msg && msg.type] || []; for (var i = 0; i < l.length; i++) l[i](msg); var a = handlers['*'] || []; for (i = 0; i < a.length; i++) a[i](msg); },
+    send: function (msg) { if (bridge.worker) bridge.worker.postMessage(msg); },
+    start: function (opts) { var m = { type: 'start' }; opts = opts || {}; for (var k in opts) m[k] = opts[k]; bridge.send(m); },
+    pause: function () { bridge.send({ type: 'pause' }); },
+    resume: function () { bridge.send({ type: 'resume' }); },
+    reset: function () { bridge.send({ type: 'reset' }); },
+    predict: function (id, x) { bridge.send({ type: 'predict', id: id, x: x }); },
+    exportWeights: function () { bridge.send({ type: 'export' }); },
+    connect: function () {
+      var demo = /[?&]demo\b/.test(location.search);
+      if (demo) { bridge.worker = makeDemoWorker(); bridge.mode = 'demo'; }
+      else if (typeof Worker === 'undefined') { bridge.mode = 'none'; bridge.emit({ type: 'noworker' }); return false; }
+      else {
+        try { bridge.worker = new Worker('train-worker.js'); bridge.mode = 'worker'; }
+        catch (e) { bridge.emit({ type: 'error', message: 'Could not start train-worker.js: ' + e.message }); return false; }
+        bridge.worker.onerror = function (e) { bridge.emit({ type: 'error', message: (e && e.message) || 'Worker failed to load (train-worker.js).' }); if (e && e.preventDefault) e.preventDefault(); };
+      }
+      bridge.worker.onmessage = function (e) { bridge.emit(e.data); };
+      return true;
+    }
+  };
+
+  // Local simulator that speaks the same protocol (for layout testing only; never used without ?demo).
+  function makeDemoWorker() {
+    var self = { onmessage: null }, step = 0, state = 'loading', t = null, ema = null, aema = null, n = 9;
+    function post(m) { setTimeout(function () { self.onmessage && self.onmessage({ data: m }); }, 0); }
+    function tick() {
+      if (state !== 'training') return;
+      for (var k = 0; k < 10; k++) step++;
+      var loss = 2.2 * Math.exp(-step / 900) + 0.12 + Math.random() * 0.15, acc = Math.min(0.99, 1 - loss / 2.4 + Math.random() * 0.05);
+      ema = ema == null ? loss : ema * 0.9 + loss * 0.1; aema = aema == null ? acc : aema * 0.9 + acc * 0.1;
+      post({ type: 'progress', step: step, epochSteps: step % 500, loss: loss, acc: acc, lossEMA: ema, accEMA: aema, samplesPerSec: 1800 + Math.random() * 300 });
+      if (step % 50 === 0) {
+        var q = Math.min(0.97, 1 - ema / 2.3), conf = [], per = [];
+        for (var i = 0; i < n; i++) { var row = []; for (var j = 0; j < n; j++) row.push(0); var c = Math.round(50 * (q - 0.05 + Math.random() * 0.1)); c = Math.max(0, Math.min(50, c)); row[i] = c; var rest = 50 - c; while (rest-- > 0) { var p = (i + 1 + Math.floor(Math.random() * 3)) % n; row[p === i ? (i + 1) % n : p]++; } conf.push(row); per.push(c / 50); }
+        post({ type: 'eval', step: step, loss: ema * 1.1, acc: per.reduce(function (a, b) { return a + b; }, 0) / n, perClass: per, confusion: conf });
+      }
+      if (step % 200 === 0) post({ type: 'saved', step: step, bytes: 48212, at: Date.now() });
+      t = setTimeout(tick, 120);
+    }
+    self.postMessage = function (m) {
+      if (m.type === 'start') { post({ type: 'ready', restored: false, steps: 0, sessions: 1 }); post({ type: 'status', state: 'loading' }); setTimeout(function () { state = 'training'; post({ type: 'status', state: 'training', message: 'Demo simulator (not the real network)' }); tick(); }, 400); }
+      else if (m.type === 'pause') { state = 'paused'; clearTimeout(t); post({ type: 'status', state: 'paused' }); post({ type: 'saved', step: step, bytes: 48212, at: Date.now() }); }
+      else if (m.type === 'resume') { state = 'training'; post({ type: 'status', state: 'training' }); tick(); }
+      else if (m.type === 'reset') { step = 0; ema = aema = null; post({ type: 'ready', restored: false, steps: 0, sessions: 1 }); }
+      else if (m.type === 'predict') { var pr = []; for (var i = 0; i < n; i++) pr.push(1 / n); post({ type: 'prediction', id: m.id, probs: pr, top: 0 }); }
+      else if (m.type === 'export') post({ type: 'weights', weights: {} });
+    };
+    self.terminate = function () { clearTimeout(t); };
+    return self;
+  }
+})();
+</script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <img src="assets/logo.svg" alt="" width="40" height="40">
+    <div class="txt">
+      <h1>TKD<span>-</span>Net</h1>
+      <p>A neural net learning taekwondo, in your browser</p>
+    </div>
+  </div>
+  <div id="status" class="status" data-state="loading" role="status" aria-live="polite">
+    <span class="dot" aria-hidden="true"></span><span id="statusText">Loading…</span>
+  </div>
+</header>
+
+<main>
+  <section id="noWorker" class="card notice span2" hidden>
+    <h2>Can't train here</h2>
+    <p id="noWorkerText">This browser can't run Web Workers, so the network can't train on this page. Try a recent Safari, Chrome or Firefox.</p>
+  </section>
+
+  <section class="card c-controls" aria-labelledby="hCtl">
+    <h2 id="hCtl">Dojo <small id="sessionInfo"></small></h2>
+    <div class="controls">
+      <button id="btnPause" class="btn primary" type="button" disabled>Pause</button>
+      <button id="btnReset" class="btn" type="button" disabled>Reset</button>
+    </div>
+    <div class="meta">
+      <span>step <b id="mStep">0</b></span>
+      <span><b id="mSps">–</b> samples/s</span>
+      <span id="mSaved">not saved yet</span>
+    </div>
+    <p id="statusMsg" class="meta" style="margin-top:8px"></p>
+  </section>
+
+  <section class="card c-acc" aria-labelledby="hAcc">
+    <h2 id="hAcc">Accuracy</h2>
+    <div class="acc">
+      <div class="stat train">
+        <div class="k">Train</div>
+        <div class="v" id="accTrain">–</div>
+        <div class="s">moving avg · step <span id="accTrainStep">–</span></div>
+        <div class="bar"><i id="accTrainBar"></i></div>
+      </div>
+      <div class="stat held">
+        <div class="k">Held-out</div>
+        <div class="v" id="accHeld">–</div>
+        <div class="s">fixed test set · step <span id="accHeldStep">–</span></div>
+        <div class="bar"><i id="accHeldBar"></i></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card c-loss" aria-labelledby="hLoss">
+    <h2 id="hLoss">Loss <small id="lossNow"></small></h2>
+    <div class="chart-wrap"><canvas id="lossChart" role="img" aria-label="Training loss over steps"></canvas></div>
+    <div class="legend">
+      <span><i style="background:rgba(79,124,240,.45)"></i>batch loss</span>
+      <span><i style="background:var(--blue-2)"></i>smoothed</span>
+      <span><i style="background:var(--gold)"></i>held-out loss</span>
+    </div>
+  </section>
+
+  <section class="card c-cm" aria-labelledby="hCm">
+    <h2 id="hCm">Confusion matrix <small id="cmStep">no eval yet</small></h2>
+    <div class="cm-axis"><span>rows: true technique</span><span>columns: predicted →</span></div>
+    <div class="cm-scroll"><div id="cm" class="cm" role="table" aria-label="Confusion matrix, rows are true technique, columns are predicted"></div></div>
+    <div class="scale"><span>0%</span><b></b><span>100%</span></div>
+    <p id="cmDetail" class="cm-detail">Tap a technique below to see what it gets mistaken for.</p>
+  </section>
+
+  <section class="card c-gallery" aria-labelledby="hGal">
+    <h2 id="hGal">Techniques <small>held-out accuracy per class</small></h2>
+    <ul id="gallery" class="gallery"></ul>
+  </section>
+
+  <section class="card c-cam" aria-labelledby="hCam">
+    <h2 id="hCam">Webcam mode <small>phase 2</small></h2>
+    <div class="cam">
+      <div class="lens" aria-hidden="true"></div>
+      <p>Soon: do a technique in front of your camera and the network will name it live. Pose tracking runs on your device; no video leaves your phone.</p>
+      <button class="btn" type="button" disabled id="btnCam">Try it (coming soon)</button>
+    </div>
+  </section>
+</main>
+<footer>Trains entirely on this device · weights saved in this browser</footer>
+
+<script src="store.js" onerror="this.dataset.missing=1"></script>
+<script>
+(function () {
+  var TKD = window.TKD, B = TKD.bridge, C = TKD.CLASSES, N = TKD.NCLASSES;
+  function $(id) { return document.getElementById(id); }
+  function pct(v) { return v == null || isNaN(v) ? '–' : (v * 100).toFixed(1) + '%'; }
+  function label(c) { return TKD.LABELS[c] || [c, c]; }
+  function art(dir, c) { return 'assets/' + dir + '/' + (TKD.ART[c] || c) + '.svg'; }
+
+  // ---------- state ----------
+  var S = { state: 'loading', step: 0, progress: [], evals: [], lastEval: null, selected: -1, running: false };
+  var MAXPTS = 500;
+
+  // ---------- status ----------
+  var STATE_TEXT = { loading: 'Loading…', training: 'Training now', paused: 'Paused', error: 'Error', idle: 'Idle' };
+  function setStatus(state, message) {
+    S.state = state; $('status').setAttribute('data-state', state);
+    $('statusText').textContent = STATE_TEXT[state] || state;
+    $('statusMsg').textContent = message || '';
+    var pb = $('btnPause');
+    pb.disabled = !(state === 'training' || state === 'paused');
+    pb.textContent = state === 'paused' ? 'Resume' : 'Pause';
+    $('btnReset').disabled = state === 'loading' && !S.running;
+  }
+
+  // ---------- accuracy ----------
+  function setTrain(acc, step) { $('accTrain').textContent = pct(acc); $('accTrainStep').textContent = step; $('accTrainBar').style.width = Math.max(0, Math.min(100, acc * 100)) + '%'; }
+  function setHeld(acc, step) { $('accHeld').textContent = pct(acc); $('accHeldStep').textContent = step; $('accHeldBar').style.width = Math.max(0, Math.min(100, acc * 100)) + '%'; }
+
+  // ---------- loss chart (hand-drawn canvas) ----------
+  var cv = $('lossChart'), ctx = cv.getContext('2d'), dirty = true;
+  function sizeCanvas() {
+    var r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+    var w = Math.max(1, Math.round(r.width * d)), h = Math.max(1, Math.round(r.height * d));
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    dirty = true;
+  }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#888'; }
+  function draw() {
+    dirty = false;
+    var d = window.devicePixelRatio || 1, W = cv.width / d, H = cv.height / d;
+    ctx.setTransform(d, 0, 0, d, 0, 0); ctx.clearRect(0, 0, W, H);
+    var P = S.progress, E = S.evals, padL = 38, padR = 10, padT = 10, padB = 24, pw = W - padL - padR, ph = H - padT - padB;
+    ctx.font = '11px ' + css('--mono'); ctx.fillStyle = css('--ink-faint'); ctx.strokeStyle = css('--line'); ctx.lineWidth = 1;
+    if (!P.length && !E.length) { ctx.textAlign = 'center'; ctx.fillText('waiting for the first steps…', W / 2, H / 2); return; }
+    var x0 = Infinity, x1 = -Infinity, ymax = 0, i, p;
+    for (i = 0; i < P.length; i++) { p = P[i]; if (p.step < x0) x0 = p.step; if (p.step > x1) x1 = p.step; if (p.loss > ymax) ymax = p.loss; }
+    for (i = 0; i < E.length; i++) { p = E[i]; if (p.step < x0) x0 = p.step; if (p.step > x1) x1 = p.step; if (p.loss > ymax) ymax = p.loss; }
+    if (x1 <= x0) x1 = x0 + 1; ymax = niceMax(ymax || 1);
+    function X(s) { return padL + (s - x0) / (x1 - x0) * pw; }
+    function Y(v) { return padT + ph - Math.max(0, Math.min(1, v / ymax)) * ph; }
+    // grid
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (i = 0; i <= 4; i++) { var gv = ymax * i / 4, gy = Y(gv); ctx.beginPath(); ctx.moveTo(padL, gy + .5); ctx.lineTo(W - padR, gy + .5); ctx.stroke(); ctx.fillText(gv.toFixed(gv < 1 ? 2 : 1), padL - 6, gy); }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (i = 0; i <= 3; i++) { var sx = x0 + (x1 - x0) * i / 3; ctx.fillText(fmtStep(sx), Math.min(W - padR - 14, Math.max(padL + 14, X(sx))), H - padB + 6); }
+    // batch loss
+    line(P, 'loss', 'rgba(79,124,240,.45)', 1);
+    line(P, 'lossEMA', css('--blue-2'), 2.2);
+    // held-out loss dots + line
+    if (E.length) { line(E, 'loss', css('--gold'), 1.6); ctx.fillStyle = css('--gold'); for (i = 0; i < E.length; i++) { ctx.beginPath(); ctx.arc(X(E[i].step), Y(E[i].loss), 2.6, 0, 6.283); ctx.fill(); } }
+    function line(arr, key, color, w) {
+      ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineJoin = 'round'; ctx.beginPath(); var started = false;
+      for (var j = 0; j < arr.length; j++) { var v = arr[j][key]; if (v == null || isNaN(v)) continue; var px = X(arr[j].step), py = Y(v); if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); }
+      ctx.stroke();
+    }
+  }
+  function niceMax(v) { var e = Math.pow(10, Math.floor(Math.log(v) / Math.LN10)), m = v / e; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * e; }
+  function fmtStep(s) { s = Math.round(s); return s >= 10000 ? (s / 1000).toFixed(0) + 'k' : s >= 1000 ? (s / 1000).toFixed(1) + 'k' : String(s); }
+  function loop() { if (dirty) draw(); requestAnimationFrame(loop); }
+  if (window.ResizeObserver) new ResizeObserver(sizeCanvas).observe(cv); else window.addEventListener('resize', sizeCanvas);
+  window.addEventListener('orientationchange', function () { setTimeout(sizeCanvas, 200); });
+  sizeCanvas(); requestAnimationFrame(loop);
+
+  // ---------- confusion matrix ----------
+  var cm = $('cm'), cells = [], rowHd = [], colHd = [];
+  (function buildCM() {
+    var corner = document.createElement('div'); corner.className = 'hd corner'; corner.setAttribute('role', 'columnheader'); corner.innerHTML = 'true ↓<br>pred →'; cm.appendChild(corner);
+    for (var j = 0; j < N; j++) colHd.push(hd(j, 'columnheader'));
+    for (var i = 0; i < N; i++) {
+      rowHd.push(hd(i, 'rowheader')); cells.push([]);
+      for (j = 0; j < N; j++) { var c = document.createElement('div'); c.className = 'cell' + (i === j ? ' diag' : ''); c.setAttribute('role', 'cell'); c.textContent = ''; cm.appendChild(c); cells[i].push(c); }
+    }
+    function hd(k, role) { var d = document.createElement('div'); d.className = 'hd'; d.setAttribute('role', role); var im = new Image(); im.src = art('icons', C[k]); im.alt = label(C[k])[1]; im.title = label(C[k])[1]; d.appendChild(im); cm.appendChild(d); return d; }
+  })();
+  function heat(f) { // 0..1 -> dark -> red -> gold
+    f = Math.max(0, Math.min(1, f));
+    var a = [14, 12, 11], b = [200, 16, 46], c = [212, 162, 74], t, r;
+    if (f < .6) { t = f / .6; r = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+    else { t = (f - .6) / .4; r = [b[0] + (c[0] - b[0]) * t, b[1] + (c[1] - b[1]) * t, b[2] + (c[2] - b[2]) * t]; }
+    return 'rgb(' + Math.round(r[0]) + ',' + Math.round(r[1]) + ',' + Math.round(r[2]) + ')';
+  }
+  function renderCM() {
+    var E = S.lastEval; if (!E || !E.confusion) return;
+    $('cmStep').textContent = 'step ' + E.step;
+    for (var i = 0; i < N; i++) {
+      var row = E.confusion[i] || [], tot = 0, j;
+      for (j = 0; j < N; j++) tot += row[j] || 0;
+      for (j = 0; j < N; j++) {
+        var f = tot ? (row[j] || 0) / tot : 0, el = cells[i][j];
+        el.style.background = heat(f); el.style.color = f > .55 ? '#14110f' : 'var(--ink)';
+        el.textContent = f >= .005 ? Math.round(f * 100) : '';
+        el.className = 'cell' + (i === j ? ' diag' : '') + (i === S.selected ? ' row' : '');
+        el.setAttribute('aria-label', label(C[i])[1] + ' predicted as ' + label(C[j])[1] + ': ' + Math.round(f * 100) + '%');
+      }
+    }
+    renderDetail(); renderGalleryAcc();
+  }
+  function renderDetail() {
+    var k = S.selected, E = S.lastEval;
+    for (var i = 0; i < N; i++) { rowHd[i].className = 'hd' + (i === k ? ' sel' : ''); colHd[i].className = 'hd'; }
+    if (k < 0) return;
+    var name = label(C[k])[1];
+    if (!E || !E.confusion) { $('cmDetail').textContent = name + ': no held-out evaluation yet.'; return; }
+    var row = E.confusion[k] || [], tot = 0, j, best = -1, bv = 0;
+    for (j = 0; j < N; j++) tot += row[j] || 0;
+    for (j = 0; j < N; j++) if (j !== k && (row[j] || 0) > bv) { bv = row[j]; best = j; }
+    var txt = name + ': ' + (tot ? Math.round((row[k] || 0) / tot * 100) : 0) + '% correct of ' + tot + ' held-out samples.';
+    if (best >= 0) { txt += ' Most often mistaken for ' + label(C[best])[1] + ' (' + Math.round(bv / tot * 100) + '%).'; colHd[best].className = 'hd sel'; }
+    else txt += ' No mistakes.';
+    $('cmDetail').textContent = txt;
+  }
+
+  // ---------- gallery ----------
+  var gal = $('gallery'), galBtns = [];
+  C.forEach(function (c, k) {
+    var li = document.createElement('li'), b = document.createElement('button'), L = label(c);
+    b.type = 'button'; b.className = 'tech'; b.setAttribute('aria-pressed', 'false');
+    b.innerHTML = '<img alt="" width="100" height="120"><span class="ko"></span><span class="en"></span><span class="pc">–</span>';
+    b.querySelector('img').src = art('skeletons', c);
+    b.querySelector('.ko').textContent = L[0]; b.querySelector('.en').textContent = L[1];
+    b.setAttribute('aria-label', L[1] + ' (' + L[0] + ')');
+    b.addEventListener('click', function () { S.selected = S.selected === k ? -1 : k; galBtns.forEach(function (x, i) { x.setAttribute('aria-pressed', i === S.selected ? 'true' : 'false'); }); if (S.selected < 0) $('cmDetail').textContent = 'Tap a technique below to see what it gets mistaken for.'; renderCM(); renderDetail(); });
+    li.appendChild(b); gal.appendChild(li); galBtns.push(b);
+  });
+  function renderGalleryAcc() {
+    var E = S.lastEval; if (!E || !E.perClass) return;
+    for (var k = 0; k < N; k++) galBtns[k].querySelector('.pc').textContent = pct(E.perClass[k]);
+  }
+
+  // ---------- worker messages ----------
+  function pushProgress(m) { S.progress.push({ step: m.step, loss: m.loss, lossEMA: m.lossEMA }); if (S.progress.length > MAXPTS) S.progress.splice(0, S.progress.length - MAXPTS); dirty = true; }
+  function pushEval(m) { S.evals.push({ step: m.step, loss: m.loss, acc: m.acc }); if (S.evals.length > MAXPTS) S.evals.shift(); dirty = true; }
+
+  B.on('noworker', function () { $('noWorker').hidden = false; setStatus('error', 'Web Workers unavailable'); });
+  B.on('ready', function (m) {
+    S.running = true; S.step = m.steps || 0; $('mStep').textContent = S.step;
+    if (!m.restored) { S.progress = []; S.evals = []; dirty = true; } // history belongs to discarded weights
+    $('sessionInfo').textContent = (m.restored ? 'resumed' : 'fresh start') + ' · session ' + (m.sessions || 1);
+    $('btnReset').disabled = false;
+  });
+  B.on('status', function (m) { setStatus(m.state, m.message); });
+  B.on('progress', function (m) {
+    S.step = m.step; $('mStep').textContent = m.step;
+    $('mSps').textContent = m.samplesPerSec != null ? Math.round(m.samplesPerSec) : '–';
+    $('lossNow').textContent = (m.lossEMA != null ? m.lossEMA : m.loss).toFixed(3);
+    setTrain(m.accEMA != null ? m.accEMA : m.acc, m.step);
+    pushProgress(m);
+    if (S.state !== 'training' && S.state !== 'paused') setStatus('training');
+  });
+  B.on('eval', function (m) { S.lastEval = m; setHeld(m.acc, m.step); pushEval(m); renderCM(); });
+  B.on('saved', function (m) { var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + ' · ' + (m.bytes != null ? (m.bytes / 1024).toFixed(0) + ' KB · ' : '') + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
+  B.on('error', function (m) { setStatus('error', m.message); });
+
+  $('btnPause').addEventListener('click', function () { if (S.state === 'paused') B.resume(); else B.pause(); });
+  $('btnReset').addEventListener('click', function () {
+    if (!confirm('Forget everything the network has learned and start from scratch?')) return;
+    S.progress = []; S.evals = []; S.lastEval = null; dirty = true; setTrain(NaN, '–'); setHeld(NaN, '–');
+    $('cmStep').textContent = 'no eval yet'; $('mSaved').textContent = 'not saved yet';
+    cells.forEach(function (r) { r.forEach(function (c) { c.style.background = ''; c.textContent = ''; }); });
+    galBtns.forEach(function (b) { b.querySelector('.pc').textContent = '–'; });
+    B.reset();
+  });
+
+  // ---------- previous curve from IndexedDB (store.js in page, optional) ----------
+  function loadHistory() {
+    try {
+      if (!TKD.store || !TKD.store.loadHistory) return Promise.resolve(null);
+      return Promise.resolve(TKD.store.loadHistory()).then(function (h) {
+        if (!h) return;
+        var prog = h.progress || (Array.isArray(h) ? h : []), ev = h.eval || h.evals || [];
+        prog.forEach(function (p) { if (p && p.step != null) pushProgress(p); });
+        ev.forEach(function (e) { if (e && e.step != null) pushEval(e); });
+        if (prog.length) { var lp = prog[prog.length - 1]; setTrain(lp.accEMA != null ? lp.accEMA : lp.acc, lp.step); }
+        if (ev.length) { var le = ev[ev.length - 1]; setHeld(le.acc, le.step); if (le.confusion) { S.lastEval = le; renderCM(); } }
+      }).catch(function () {});
+    } catch (e) { return Promise.resolve(null); }
+  }
+
+  setStatus('loading');
+  var booted = false; function boot() { if (booted) return; booted = true; if (B.connect()) B.start(); }
+  Promise.race([loadHistory(), new Promise(function (r) { setTimeout(r, 1500); })]).then(boot, boot);
+  document.addEventListener('visibilitychange', function () { dirty = true; });
+})();
+</script>
+</body>
+</html>
