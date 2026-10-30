@@ -3,41 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0e0c0b">
+<meta name="theme-color" content="#0a0908">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="TKD-Net">
-<title>TKD-Net · taekwondo technique trainer</title>
+<title>TKD-Net · a neural net learning taekwondo</title>
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 <link rel="stylesheet" href="assets/theme.css">
 <link rel="stylesheet" href="style.css">
 <script>
-/* ===== Contract adapter (CONTRACT.md v1) ===================================================
-   The ONLY place that knows the worker's message protocol. Everything below the adapter
-   consumes the normalised callbacks. Page -> worker: start | pause | resume | reset | predict | export.
-   Worker -> page: ready | status | progress | eval | saved | prediction | weights | error.
-   Add ?demo to the URL to drive the UI from a local simulator instead of train-worker.js. */
+/* ===== Contract adapter (CONTRACT.md v1 + optional net-info, see NETINFO_REQUEST.md) =====================
+   The ONLY place that knows the worker protocol. Page -> worker: start | pause | resume | reset | predict | export.
+   Worker -> page: ready | status | progress | eval | saved | prediction | weights | error, plus OPTIONAL `netinfo`
+   (or a `net` field on progress/eval/status/ready). Add ?demo to drive the UI from a local simulator. */
 (function () {
   var TKD = window.TKD = window.TKD || {};
-  // Contract constants (owned by nn.js, which runs in the worker; mirrored here for the page).
-  if (!TKD.CLASSES) TKD.CLASSES = ['ready','front_kick','roundhouse','side_kick','back_kick','axe_kick','low_block','high_block','punch'];
-  if (!TKD.NCLASSES) TKD.NCLASSES = 9;
-  if (!TKD.FRAMES) TKD.FRAMES = 16;
-  if (!TKD.FEATURES) TKD.FEATURES = 34;
-  // Class id -> art file name in assets/icons and assets/skeletons (art uses hyphenated ids).
-  TKD.ART = { ready:'ready-stance', front_kick:'front-kick', roundhouse:'roundhouse-kick', side_kick:'side-kick',
-    back_kick:'back-kick', axe_kick:'axe-kick', low_block:'low-block', high_block:'high-block', punch:'punch' };
-  TKD.LABELS = { ready:['Junbi','Ready stance'], front_kick:['Ap chagi','Front kick'], roundhouse:['Dollyo chagi','Roundhouse kick'],
-    side_kick:['Yeop chagi','Side kick'], back_kick:['Dwit chagi','Back kick'], axe_kick:['Naeryeo chagi','Axe kick'],
-    low_block:['Arae makki','Low block'], high_block:['Olgul makki','High block'], punch:['Jireugi','Middle punch'] };
-
   var handlers = {};
   var bridge = TKD.bridge = {
     worker: null, mode: 'none',
     on: function (type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
-    emit: function (msg) { var l = handlers[msg && msg.type] || []; for (var i = 0; i < l.length; i++) l[i](msg); var a = handlers['*'] || []; for (i = 0; i < a.length; i++) a[i](msg); },
+    emit: function (msg) { if (!msg || typeof msg !== 'object') return; var l = handlers[msg.type] || [], i; for (i = 0; i < l.length; i++) { try { l[i](msg); } catch (e) { if (window.console) console.warn('[tkd-ui]', msg.type, e); } } l = handlers['*'] || []; for (i = 0; i < l.length; i++) { try { l[i](msg); } catch (e) {} } },
     send: function (msg) { if (bridge.worker) bridge.worker.postMessage(msg); },
     start: function (opts) { var m = { type: 'start' }; opts = opts || {}; for (var k in opts) m[k] = opts[k]; bridge.send(m); },
     pause: function () { bridge.send({ type: 'pause' }); },
@@ -45,45 +32,47 @@
     reset: function () { bridge.send({ type: 'reset' }); },
     predict: function (id, x) { bridge.send({ type: 'predict', id: id, x: x }); },
     exportWeights: function () { bridge.send({ type: 'export' }); },
+    flush: function () { bridge.send({ type: 'flush' }); }, // v2 worker; v1 ignores unknown types (default: break)
     connect: function () {
-      var demo = /[?&]demo\b/.test(location.search);
-      if (demo) { bridge.worker = makeDemoWorker(); bridge.mode = 'demo'; }
-      else if (typeof Worker === 'undefined') { bridge.mode = 'none'; bridge.emit({ type: 'noworker' }); return false; }
+      if (/[?&]demo\b/.test(location.search)) { bridge.worker = makeDemoWorker(); bridge.mode = 'demo'; }
+      else if (typeof Worker === 'undefined') { bridge.emit({ type: 'noworker' }); return false; }
       else {
         try { bridge.worker = new Worker('train-worker.js'); bridge.mode = 'worker'; }
         catch (e) { bridge.emit({ type: 'error', message: 'Could not start train-worker.js: ' + e.message }); return false; }
         bridge.worker.onerror = function (e) { bridge.emit({ type: 'error', message: (e && e.message) || 'Worker failed to load (train-worker.js).' }); if (e && e.preventDefault) e.preventDefault(); };
       }
-      bridge.worker.onmessage = function (e) { bridge.emit(e.data); };
+      bridge.worker.onmessage = function (e) { if (bridge.filter && !bridge.filter(e.data)) return; bridge.emit(e.data); };
       return true;
     }
   };
 
-  // Local simulator that speaks the same protocol (for layout testing only; never used without ?demo).
+  // Layout-test simulator (?demo only). Sends no weights, no activations and no predictions, so nothing
+  // network-shaped is ever invented; the net view stays in its "waiting for network data" state.
   function makeDemoWorker() {
-    var self = { onmessage: null }, step = 0, state = 'loading', t = null, ema = null, aema = null, n = 9;
+    var self = { onmessage: null }, step = 0, state = 'loading', t = null, ema = null, aema = null;
+    var n = (TKD.CLASSES && TKD.CLASSES.length) || 9;
     function post(m) { setTimeout(function () { self.onmessage && self.onmessage({ data: m }); }, 0); }
     function tick() {
       if (state !== 'training') return;
-      for (var k = 0; k < 10; k++) step++;
+      step += 10;
       var loss = 2.2 * Math.exp(-step / 900) + 0.12 + Math.random() * 0.15, acc = Math.min(0.99, 1 - loss / 2.4 + Math.random() * 0.05);
       ema = ema == null ? loss : ema * 0.9 + loss * 0.1; aema = aema == null ? acc : aema * 0.9 + acc * 0.1;
       post({ type: 'progress', step: step, epochSteps: step % 500, loss: loss, acc: acc, lossEMA: ema, accEMA: aema, samplesPerSec: 1800 + Math.random() * 300 });
       if (step % 50 === 0) {
-        var q = Math.min(0.97, 1 - ema / 2.3), conf = [], per = [];
-        for (var i = 0; i < n; i++) { var row = []; for (var j = 0; j < n; j++) row.push(0); var c = Math.round(50 * (q - 0.05 + Math.random() * 0.1)); c = Math.max(0, Math.min(50, c)); row[i] = c; var rest = 50 - c; while (rest-- > 0) { var p = (i + 1 + Math.floor(Math.random() * 3)) % n; row[p === i ? (i + 1) % n : p]++; } conf.push(row); per.push(c / 50); }
+        var q = Math.min(0.97, 1 - ema / 2.3), conf = [], per = [], i, j;
+        for (i = 0; i < n; i++) { var row = []; for (j = 0; j < n; j++) row.push(0); var c = Math.max(0, Math.min(50, Math.round(50 * (q - 0.05 + Math.random() * 0.1)))); row[i] = c; var rest = 50 - c; while (rest-- > 0) row[(i + 1 + Math.floor(Math.random() * 3)) % n]++; conf.push(row); per.push(c / 50); }
         post({ type: 'eval', step: step, loss: ema * 1.1, acc: per.reduce(function (a, b) { return a + b; }, 0) / n, perClass: per, confusion: conf });
       }
       if (step % 200 === 0) post({ type: 'saved', step: step, bytes: 48212, at: Date.now() });
       t = setTimeout(tick, 120);
     }
     self.postMessage = function (m) {
-      if (m.type === 'start') { post({ type: 'ready', restored: false, steps: 0, sessions: 1 }); post({ type: 'status', state: 'loading' }); setTimeout(function () { state = 'training'; post({ type: 'status', state: 'training', message: 'Demo simulator (not the real network)' }); tick(); }, 400); }
-      else if (m.type === 'pause') { state = 'paused'; clearTimeout(t); post({ type: 'status', state: 'paused' }); post({ type: 'saved', step: step, bytes: 48212, at: Date.now() }); }
-      else if (m.type === 'resume') { state = 'training'; post({ type: 'status', state: 'training' }); tick(); }
+      if (m.type === 'start') { post({ type: 'ready', restored: false, steps: 0, sessions: 1 }); post({ type: 'status', state: 'loading' }); setTimeout(function () { state = 'training'; post({ type: 'status', state: 'training', message: 'Demo simulator: curves are made up, not the real network' }); tick(); }, 400); }
+      else if (m.type === 'pause') { state = 'paused'; clearTimeout(t); post({ type: 'status', state: 'paused' }); }
+      else if (m.type === 'resume') { state = 'training'; post({ type: 'status', state: 'training', message: 'Demo simulator: curves are made up, not the real network' }); tick(); }
       else if (m.type === 'reset') { step = 0; ema = aema = null; post({ type: 'ready', restored: false, steps: 0, sessions: 1 }); }
-      else if (m.type === 'predict') { var pr = []; for (var i = 0; i < n; i++) pr.push(1 / n); post({ type: 'prediction', id: m.id, probs: pr, top: 0 }); }
-      else if (m.type === 'export') post({ type: 'weights', weights: {} });
+      else if (m.type === 'predict') post({ type: 'prediction', id: m.id, probs: [], top: -1, ready: false });
+      else if (m.type === 'export') post({ type: 'weights', weights: null });
     };
     self.terminate = function () { clearTimeout(t); };
     return self;
@@ -92,12 +81,13 @@
 </script>
 </head>
 <body>
+<div class="vignette" aria-hidden="true"></div>
 <header class="top">
   <div class="brand">
     <img src="assets/logo.svg" alt="" width="40" height="40">
     <div class="txt">
-      <h1>TKD<span>-</span>Net</h1>
-      <p>A neural net learning taekwondo, in your browser</p>
+      <h1>TKD<span class="dash">-</span>NET <span class="seal" aria-hidden="true">跆</span></h1>
+      <p>A neural network learning taekwondo, live in your browser</p>
     </div>
   </div>
   <div id="status" class="status" data-state="loading" role="status" aria-live="polite">
@@ -106,9 +96,46 @@
 </header>
 
 <main>
-  <section id="noWorker" class="card notice span2" hidden>
+  <section id="noWorker" class="card notice span-all" hidden>
     <h2>Can't train here</h2>
-    <p id="noWorkerText">This browser can't run Web Workers, so the network can't train on this page. Try a recent Safari, Chrome or Firefox.</p>
+    <p>This browser can't run Web Workers, so the network can't train on this page. Try a recent Safari, Chrome or Firefox.</p>
+  </section>
+
+  <!-- ===== Big live technique callout ===== -->
+  <section class="card hero c-hero" aria-labelledby="calloutName" aria-live="polite">
+    <div class="hero-top">
+      <span id="calloutSource" class="chip" data-kind="idle">Waiting for the network…</span>
+    </div>
+    <div class="hero-body">
+      <div class="hero-fig"><img id="calloutImg" src="assets/skeletons/ready-stance.svg" alt="" width="100" height="120"></div>
+      <div class="hero-text">
+        <div id="calloutKo" class="ko">준비 · Junbi</div>
+        <h2 id="calloutName" class="big">Ready stance</h2>
+        <div id="calloutConfWrap" class="conf" hidden>
+          <div class="conf-row"><span>confidence</span><b id="calloutConf">–</b></div>
+          <div class="conf-bar"><i id="calloutConfBar"></i></div>
+        </div>
+        <p id="calloutTruth" class="truth"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real network view ===== -->
+  <section class="card c-net" aria-labelledby="hNet">
+    <h2 id="hNet">The network <small id="netSource">waiting for network data</small></h2>
+    <div class="net-tools"><button id="btn3d" class="btn small" type="button" hidden aria-pressed="false">3D view</button></div>
+    <div class="net-readouts">
+      <div><span>parameters</span><b id="rParams">–</b></div>
+      <div><span>steps / s</span><b id="rSteps">–</b></div>
+      <div><span>samples / s</span><b id="rSps">–</b></div>
+      <div><span>step</span><b id="rStep">–</b></div>
+    </div>
+    <div class="net-wrap"><canvas id="netCanvas" role="img" aria-label="Diagram of the network's layers and connections"></canvas></div>
+    <p id="netCaption" class="net-caption">Waiting for network data…</p>
+    <div class="table-scroll"><table class="layers" aria-label="Layer weight statistics">
+      <thead><tr><th>layer</th><th>shape</th><th>params</th><th>‖W‖</th><th>Δ‖W‖ / step</th></tr></thead>
+      <tbody id="layerRows"><tr><td colspan="5" class="muted">waiting for network data</td></tr></tbody>
+    </table></div>
   </section>
 
   <section class="card c-controls" aria-labelledby="hCtl">
@@ -116,13 +143,13 @@
     <div class="controls">
       <button id="btnPause" class="btn primary" type="button" disabled>Pause</button>
       <button id="btnReset" class="btn" type="button" disabled>Reset</button>
+      <button id="btnExport" class="btn" type="button" disabled>Export weights</button>
     </div>
     <div class="meta">
       <span>step <b id="mStep">0</b></span>
-      <span><b id="mSps">–</b> samples/s</span>
       <span id="mSaved">not saved yet</span>
     </div>
-    <p id="statusMsg" class="meta" style="margin-top:8px"></p>
+    <p id="statusMsg" class="meta"></p>
   </section>
 
   <section class="card c-acc" aria-labelledby="hAcc">
@@ -141,13 +168,14 @@
         <div class="bar"><i id="accHeldBar"></i></div>
       </div>
     </div>
+    <p class="honest"><b>Honest note:</b> these scores are on <em>synthetic</em> stick-figure skeletons generated in your browser, not on real people and not a measure of real taekwondo skill.</p>
   </section>
 
   <section class="card c-loss" aria-labelledby="hLoss">
     <h2 id="hLoss">Loss <small id="lossNow"></small></h2>
     <div class="chart-wrap"><canvas id="lossChart" role="img" aria-label="Training loss over steps"></canvas></div>
     <div class="legend">
-      <span><i style="background:rgba(79,124,240,.45)"></i>batch loss</span>
+      <span><i style="background:rgba(120,150,230,.5)"></i>batch loss</span>
       <span><i style="background:var(--blue-2)"></i>smoothed</span>
       <span><i style="background:var(--gold)"></i>held-out loss</span>
     </div>
@@ -156,42 +184,90 @@
   <section class="card c-cm" aria-labelledby="hCm">
     <h2 id="hCm">Confusion matrix <small id="cmStep">no eval yet</small></h2>
     <div class="cm-axis"><span>rows: true technique</span><span>columns: predicted →</span></div>
-    <div class="cm-scroll"><div id="cm" class="cm" role="table" aria-label="Confusion matrix, rows are true technique, columns are predicted"></div></div>
+    <div class="cm-scroll" tabindex="0" aria-label="Confusion matrix, scrolls sideways"><div id="cm" class="cm" role="table"></div></div>
     <div class="scale"><span>0%</span><b></b><span>100%</span></div>
     <p id="cmDetail" class="cm-detail">Tap a technique below to see what it gets mistaken for.</p>
   </section>
 
   <section class="card c-gallery" aria-labelledby="hGal">
-    <h2 id="hGal">Techniques <small>held-out accuracy per class</small></h2>
+    <h2 id="hGal">Techniques <small id="galCount">held-out accuracy per class</small></h2>
     <ul id="gallery" class="gallery"></ul>
   </section>
 
   <section class="card c-cam" aria-labelledby="hCam">
     <h2 id="hCam">Webcam mode <small>phase 2</small></h2>
-    <div class="cam">
+    <!-- ===== CAM SLOT: reserved for webcam.js (Waffle). Put the camera UI inside #cam-slot and call
+         window.TKDUI.setLivePrediction(classIndex, confidence) with each live result. ===== -->
+    <div id="cam-slot" class="cam-slot"></div>
+    <div id="camPlaceholder" class="cam">
       <div class="lens" aria-hidden="true"></div>
       <p>Soon: do a technique in front of your camera and the network will name it live. Pose tracking runs on your device; no video leaves your phone.</p>
-      <button class="btn" type="button" disabled id="btnCam">Try it (coming soon)</button>
+      <button class="btn" type="button" disabled>Try it (coming soon)</button>
     </div>
   </section>
 </main>
-<footer>Trains entirely on this device · weights saved in this browser</footer>
+<footer>Trains entirely on this device · synthetic training data only · weights saved in this browser</footer>
 
-<script src="store.js" onerror="this.dataset.missing=1"></script>
+<!-- Same classic scripts the worker imports; loaded here only for TKD.CLASSES, synthetic showcase samples and saved history. -->
+<script src="nn.js" onerror="window.__tkdMissing=(window.__tkdMissing||[]).concat('nn.js')"></script>
+<script src="data.js" onerror="window.__tkdMissing=(window.__tkdMissing||[]).concat('data.js')"></script>
+<script src="store.js" onerror="window.__tkdMissing=(window.__tkdMissing||[]).concat('store.js')"></script>
 <script>
 (function () {
-  var TKD = window.TKD, B = TKD.bridge, C = TKD.CLASSES, N = TKD.NCLASSES;
+  'use strict';
+  var TKD = window.TKD, B = TKD.bridge;
   function $(id) { return document.getElementById(id); }
   function pct(v) { return v == null || isNaN(v) ? '–' : (v * 100).toFixed(1) + '%'; }
-  function label(c) { return TKD.LABELS[c] || [c, c]; }
-  function art(dir, c) { return 'assets/' + dir + '/' + (TKD.ART[c] || c) + '.svg'; }
+  function fmtInt(n) { if (n == null || isNaN(n)) return '–'; n = Math.round(n); return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function fmtSci(v) { if (v == null || !isFinite(v)) return '–'; if (v === 0) return '0'; var a = Math.abs(v); return a >= 100 ? v.toFixed(0) : a >= 1 ? v.toFixed(2) : a >= 0.001 ? v.toFixed(4) : v.toExponential(1); }
+  var reduced = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (window.matchMedia) { var mq = matchMedia('(prefers-reduced-motion: reduce)'); var onMq = function () { reduced = mq.matches; kick(); }; if (mq.addEventListener) mq.addEventListener('change', onMq); else if (mq.addListener) mq.addListener(onMq); }
+
+  // ---------- techniques (labels + art), class list ----------
+  var BUILTIN = [ // fallback if assets/techniques.json can't be fetched
+    ['ready','ready-stance','Ready stance','Junbi','준비'],['front_kick','front-kick','Front kick','Ap chagi','앞차기'],
+    ['roundhouse','roundhouse-kick','Roundhouse kick','Dollyo chagi','돌려차기'],['side_kick','side-kick','Side kick','Yeop chagi','옆차기'],
+    ['back_kick','back-kick','Back kick','Dwit chagi','뒤차기'],['axe_kick','axe-kick','Axe kick','Naeryeo chagi','내려차기'],
+    ['low_block','low-block','Low block','Arae makki','아래막기'],['high_block','high-block','High block','Olgul makki','얼굴막기'],
+    ['punch','punch','Middle punch','Momtong jireugi','몸통지르기'],['hook_kick','hook-kick','Hook kick','Huryeo chagi','후려차기'],
+    ['spinning_hook_kick','spinning-hook-kick','Spinning hook kick','Dwi huryeo chagi','뒤후려차기'],['jump_front_kick','jump-front-kick','Jump front kick','Twieo ap chagi','뛰어앞차기'],
+    ['knifehand_block','knifehand-block','Knifehand block','Sonnal makki','손날막기'],['combo_block_punch','combo-block-punch','Combo: low block → punch'],
+    ['combo_front_roundhouse','combo-front-roundhouse','Combo: front kick → roundhouse'],['combo_kick_punch','combo-kick-punch','Combo: front kick → punch']];
+  var TECH = {};
+  function norm(id) { return String(id).toLowerCase().replace(/[\s-]+/g, '_'); }
+  function addTech(t) { if (!t || t.id == null) return; var k = norm(t.id); TECH[k] = t; if (t.slug) TECH[norm(t.slug)] = TECH[norm(t.slug)] || t; }
+  BUILTIN.forEach(function (b) { addTech({ id: b[0], slug: b[1], english: b[2], korean: b[3] || null, hangul: b[4] || null }); });
+  function techFor(id) {
+    var t = TECH[norm(id)];
+    if (t) return t;
+    var en = String(id).replace(/[_-]+/g, ' ').replace(/^\w/, function (c) { return c.toUpperCase(); });
+    return { id: id, slug: String(id).replace(/_/g, '-'), english: en, korean: null, hangul: null, unknown: true };
+  }
+  function art(kind, id) { var t = techFor(id); return (kind === 'icons' ? t.icon : t.skeleton) || ('assets/' + kind + '/' + t.slug + '.svg'); }
+  function imgFallback(img) { img.onerror = function () { img.onerror = null; img.src = 'assets/icons/unknown.svg'; }; }
+  function koLine(t) { return [t.hangul, t.korean].filter(Boolean).join(' · '); }
+
+  var CLASSES = [];
+  function pickClasses(fromMsg, n) {
+    var src = (fromMsg && fromMsg.length && fromMsg) || (TKD.CLASSES && TKD.CLASSES.length && TKD.CLASSES) ||
+      (TKD.data && TKD.data.techniques && TKD.data.techniques.length && TKD.data.techniques) || BUILTIN.slice(0, 9).map(function (b) { return b[0]; });
+    src = src.slice();
+    if (n) { while (src.length < n) src.push(BUILTIN[src.length] && src.slice(0, 9).join() === BUILTIN.slice(0, 9).map(function (b) { return b[0]; }).join() ? BUILTIN[src.length][0] : 'class_' + src.length); if (src.length > n) src.length = n; }
+    return src;
+  }
+  function setClasses(list) {
+    var same = list.length === CLASSES.length && list.every(function (c, i) { return c === CLASSES[i]; });
+    if (same) return;
+    CLASSES = list; S.selected = -1; buildCM(); buildGallery(); net.layout = null; net.staticDirty = true; kick();
+  }
 
   // ---------- state ----------
-  var S = { state: 'loading', step: 0, progress: [], evals: [], lastEval: null, selected: -1, running: false };
+  var S = { state: 'loading', step: 0, progress: [], evals: [], lastEval: null, selected: -1, running: false,
+    sps: null, stepRate: null, lastProg: null, liveUntil: 0 };
   var MAXPTS = 500;
 
   // ---------- status ----------
-  var STATE_TEXT = { loading: 'Loading…', training: 'Training now', paused: 'Paused', error: 'Error', idle: 'Idle' };
+  var STATE_TEXT = { loading: 'Loading…', training: 'Training now', paused: 'Paused', error: 'Error' };
   function setStatus(state, message) {
     S.state = state; $('status').setAttribute('data-state', state);
     $('statusText').textContent = STATE_TEXT[state] || state;
@@ -199,177 +275,672 @@
     var pb = $('btnPause');
     pb.disabled = !(state === 'training' || state === 'paused');
     pb.textContent = state === 'paused' ? 'Resume' : 'Pause';
-    $('btnReset').disabled = state === 'loading' && !S.running;
+    if (S.running) $('btnReset').disabled = false;
+    kick();
   }
 
   // ---------- accuracy ----------
-  function setTrain(acc, step) { $('accTrain').textContent = pct(acc); $('accTrainStep').textContent = step; $('accTrainBar').style.width = Math.max(0, Math.min(100, acc * 100)) + '%'; }
-  function setHeld(acc, step) { $('accHeld').textContent = pct(acc); $('accHeldStep').textContent = step; $('accHeldBar').style.width = Math.max(0, Math.min(100, acc * 100)) + '%'; }
-
-  // ---------- loss chart (hand-drawn canvas) ----------
-  var cv = $('lossChart'), ctx = cv.getContext('2d'), dirty = true;
-  function sizeCanvas() {
-    var r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
-    var w = Math.max(1, Math.round(r.width * d)), h = Math.max(1, Math.round(r.height * d));
-    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-    dirty = true;
+  function setStat(which, acc, step) {
+    $('acc' + which).textContent = pct(acc); $('acc' + which + 'Step').textContent = step == null ? '–' : step;
+    $('acc' + which + 'Bar').style.width = (isNaN(acc) || acc == null ? 0 : Math.max(0, Math.min(100, acc * 100))) + '%';
   }
-  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#888'; }
-  function draw() {
-    dirty = false;
-    var d = window.devicePixelRatio || 1, W = cv.width / d, H = cv.height / d;
+
+  // ---------- loss chart ----------
+  var cv = $('lossChart'), ctx = cv.getContext('2d'), lossDirty = true;
+  function sizeCanvas(c) { var r = c.getBoundingClientRect(), d = Math.min(2, window.devicePixelRatio || 1), w = Math.max(1, Math.round(r.width * d)), h = Math.max(1, Math.round(r.height * d)); if (c.width !== w || c.height !== h) { c.width = w; c.height = h; return true; } return false; }
+  var cssCache = {};
+  function css(v) { return cssCache[v] || (cssCache[v] = getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#888'); }
+  function drawLoss() {
+    lossDirty = false;
+    var d = cv.width / Math.max(1, cv.getBoundingClientRect().width), W = cv.width / d, H = cv.height / d;
     ctx.setTransform(d, 0, 0, d, 0, 0); ctx.clearRect(0, 0, W, H);
-    var P = S.progress, E = S.evals, padL = 38, padR = 10, padT = 10, padB = 24, pw = W - padL - padR, ph = H - padT - padB;
+    var P = S.progress, E = S.evals, padL = 40, padR = 10, padT = 10, padB = 24, pw = W - padL - padR, ph = H - padT - padB, i, p;
     ctx.font = '11px ' + css('--mono'); ctx.fillStyle = css('--ink-faint'); ctx.strokeStyle = css('--line'); ctx.lineWidth = 1;
-    if (!P.length && !E.length) { ctx.textAlign = 'center'; ctx.fillText('waiting for the first steps…', W / 2, H / 2); return; }
-    var x0 = Infinity, x1 = -Infinity, ymax = 0, i, p;
-    for (i = 0; i < P.length; i++) { p = P[i]; if (p.step < x0) x0 = p.step; if (p.step > x1) x1 = p.step; if (p.loss > ymax) ymax = p.loss; }
-    for (i = 0; i < E.length; i++) { p = E[i]; if (p.step < x0) x0 = p.step; if (p.step > x1) x1 = p.step; if (p.loss > ymax) ymax = p.loss; }
+    if (!P.length && !E.length) { ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('waiting for the first steps…', W / 2, H / 2); return; }
+    var x0 = Infinity, x1 = -Infinity, ymax = 0;
+    function ext(p) { if (p.step < x0) x0 = p.step; if (p.step > x1) x1 = p.step; if (p.loss > ymax && isFinite(p.loss)) ymax = p.loss; }
+    P.forEach(ext); E.forEach(ext);
     if (x1 <= x0) x1 = x0 + 1; ymax = niceMax(ymax || 1);
     function X(s) { return padL + (s - x0) / (x1 - x0) * pw; }
     function Y(v) { return padT + ph - Math.max(0, Math.min(1, v / ymax)) * ph; }
-    // grid
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-    for (i = 0; i <= 4; i++) { var gv = ymax * i / 4, gy = Y(gv); ctx.beginPath(); ctx.moveTo(padL, gy + .5); ctx.lineTo(W - padR, gy + .5); ctx.stroke(); ctx.fillText(gv.toFixed(gv < 1 ? 2 : 1), padL - 6, gy); }
+    for (i = 0; i <= 4; i++) { var gv = ymax * i / 4, gy = Y(gv); ctx.beginPath(); ctx.moveTo(padL, Math.round(gy) + .5); ctx.lineTo(W - padR, Math.round(gy) + .5); ctx.stroke(); ctx.fillText(gv.toFixed(gv < 1 ? 2 : 1), padL - 6, gy); }
     ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     for (i = 0; i <= 3; i++) { var sx = x0 + (x1 - x0) * i / 3; ctx.fillText(fmtStep(sx), Math.min(W - padR - 14, Math.max(padL + 14, X(sx))), H - padB + 6); }
-    // batch loss
-    line(P, 'loss', 'rgba(79,124,240,.45)', 1);
-    line(P, 'lossEMA', css('--blue-2'), 2.2);
-    // held-out loss dots + line
+    line(P, 'loss', 'rgba(120,150,230,.45)', 1); line(P, 'lossEMA', css('--blue-2'), 2.2);
     if (E.length) { line(E, 'loss', css('--gold'), 1.6); ctx.fillStyle = css('--gold'); for (i = 0; i < E.length; i++) { ctx.beginPath(); ctx.arc(X(E[i].step), Y(E[i].loss), 2.6, 0, 6.283); ctx.fill(); } }
-    function line(arr, key, color, w) {
-      ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineJoin = 'round'; ctx.beginPath(); var started = false;
-      for (var j = 0; j < arr.length; j++) { var v = arr[j][key]; if (v == null || isNaN(v)) continue; var px = X(arr[j].step), py = Y(v); if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); }
-      ctx.stroke();
-    }
+    function line(arr, key, color, w) { ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineJoin = 'round'; ctx.beginPath(); var st = false; for (var j = 0; j < arr.length; j++) { var v = arr[j][key]; if (v == null || !isFinite(v)) continue; var px = X(arr[j].step), py = Y(v); if (!st) { ctx.moveTo(px, py); st = true; } else ctx.lineTo(px, py); } ctx.stroke(); }
   }
   function niceMax(v) { var e = Math.pow(10, Math.floor(Math.log(v) / Math.LN10)), m = v / e; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * e; }
   function fmtStep(s) { s = Math.round(s); return s >= 10000 ? (s / 1000).toFixed(0) + 'k' : s >= 1000 ? (s / 1000).toFixed(1) + 'k' : String(s); }
-  function loop() { if (dirty) draw(); requestAnimationFrame(loop); }
-  if (window.ResizeObserver) new ResizeObserver(sizeCanvas).observe(cv); else window.addEventListener('resize', sizeCanvas);
-  window.addEventListener('orientationchange', function () { setTimeout(sizeCanvas, 200); });
-  sizeCanvas(); requestAnimationFrame(loop);
 
-  // ---------- confusion matrix ----------
+  // ---------- confusion matrix (N x N) ----------
   var cm = $('cm'), cells = [], rowHd = [], colHd = [];
-  (function buildCM() {
+  function buildCM() {
+    var N = CLASSES.length; cm.innerHTML = ''; cells = []; rowHd = []; colHd = [];
+    cm.className = 'cm' + (N > 10 ? ' compact' : '');
+    cm.style.setProperty('--n', N);
     var corner = document.createElement('div'); corner.className = 'hd corner'; corner.setAttribute('role', 'columnheader'); corner.innerHTML = 'true ↓<br>pred →'; cm.appendChild(corner);
-    for (var j = 0; j < N; j++) colHd.push(hd(j, 'columnheader'));
-    for (var i = 0; i < N; i++) {
-      rowHd.push(hd(i, 'rowheader')); cells.push([]);
-      for (j = 0; j < N; j++) { var c = document.createElement('div'); c.className = 'cell' + (i === j ? ' diag' : ''); c.setAttribute('role', 'cell'); c.textContent = ''; cm.appendChild(c); cells[i].push(c); }
+    var j, i;
+    for (j = 0; j < N; j++) colHd.push(hd(j, 'columnheader'));
+    for (i = 0; i < N; i++) {
+      var row = document.createElement('div'); row.setAttribute('role', 'row'); row.style.display = 'contents'; cm.appendChild(row);
+      rowHd.push(hd(i, 'rowheader', row)); cells.push([]);
+      for (j = 0; j < N; j++) { var c = document.createElement('div'); c.className = 'cell' + (i === j ? ' diag' : ''); c.setAttribute('role', 'cell'); row.appendChild(c); cells[i].push(c); }
     }
-    function hd(k, role) { var d = document.createElement('div'); d.className = 'hd'; d.setAttribute('role', role); var im = new Image(); im.src = art('icons', C[k]); im.alt = label(C[k])[1]; im.title = label(C[k])[1]; d.appendChild(im); cm.appendChild(d); return d; }
-  })();
-  function heat(f) { // 0..1 -> dark -> red -> gold
+    function hd(k, role, parent) { var d = document.createElement('div'); d.className = 'hd'; d.setAttribute('role', role); var im = new Image(); imgFallback(im); im.src = art('icons', CLASSES[k]); var t = techFor(CLASSES[k]); im.alt = t.english; im.title = t.english; d.appendChild(im); (parent || cm).appendChild(d); return d; }
+    $('cmStep').textContent = S.lastEval ? 'step ' + S.lastEval.step : 'no eval yet';
+    renderCM();
+  }
+  function heat(f) {
     f = Math.max(0, Math.min(1, f));
-    var a = [14, 12, 11], b = [200, 16, 46], c = [212, 162, 74], t, r;
+    var a = [16, 13, 11], b = [150, 22, 40], c = [222, 172, 84], t, r;
     if (f < .6) { t = f / .6; r = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
     else { t = (f - .6) / .4; r = [b[0] + (c[0] - b[0]) * t, b[1] + (c[1] - b[1]) * t, b[2] + (c[2] - b[2]) * t]; }
     return 'rgb(' + Math.round(r[0]) + ',' + Math.round(r[1]) + ',' + Math.round(r[2]) + ')';
   }
   function renderCM() {
-    var E = S.lastEval; if (!E || !E.confusion) return;
+    var E = S.lastEval, N = CLASSES.length; if (!E || !E.confusion || !cells.length) return;
     $('cmStep').textContent = 'step ' + E.step;
+    var compact = N > 10;
     for (var i = 0; i < N; i++) {
       var row = E.confusion[i] || [], tot = 0, j;
-      for (j = 0; j < N; j++) tot += row[j] || 0;
+      for (j = 0; j < N; j++) tot += +row[j] || 0;
       for (j = 0; j < N; j++) {
-        var f = tot ? (row[j] || 0) / tot : 0, el = cells[i][j];
-        el.style.background = heat(f); el.style.color = f > .55 ? '#14110f' : 'var(--ink)';
-        el.textContent = f >= .005 ? Math.round(f * 100) : '';
+        var f = tot ? (+row[j] || 0) / tot : 0, el = cells[i][j];
+        el.style.background = heat(f); el.style.color = f > .6 ? '#14110f' : 'var(--ink)';
+        el.textContent = !compact && f >= .005 ? Math.round(f * 100) : '';
         el.className = 'cell' + (i === j ? ' diag' : '') + (i === S.selected ? ' row' : '');
-        el.setAttribute('aria-label', label(C[i])[1] + ' predicted as ' + label(C[j])[1] + ': ' + Math.round(f * 100) + '%');
+        el.setAttribute('aria-label', techFor(CLASSES[i]).english + ' predicted as ' + techFor(CLASSES[j]).english + ': ' + Math.round(f * 100) + '%');
       }
     }
     renderDetail(); renderGalleryAcc();
   }
   function renderDetail() {
-    var k = S.selected, E = S.lastEval;
-    for (var i = 0; i < N; i++) { rowHd[i].className = 'hd' + (i === k ? ' sel' : ''); colHd[i].className = 'hd'; }
-    if (k < 0) return;
-    var name = label(C[k])[1];
+    var k = S.selected, E = S.lastEval, N = CLASSES.length, i;
+    for (i = 0; i < rowHd.length; i++) { rowHd[i].className = 'hd' + (i === k ? ' sel' : ''); colHd[i].className = 'hd'; }
+    if (k < 0 || k >= N) { $('cmDetail').textContent = 'Tap a technique below to see what it gets mistaken for.'; return; }
+    var name = techFor(CLASSES[k]).english;
     if (!E || !E.confusion) { $('cmDetail').textContent = name + ': no held-out evaluation yet.'; return; }
     var row = E.confusion[k] || [], tot = 0, j, best = -1, bv = 0;
-    for (j = 0; j < N; j++) tot += row[j] || 0;
-    for (j = 0; j < N; j++) if (j !== k && (row[j] || 0) > bv) { bv = row[j]; best = j; }
-    var txt = name + ': ' + (tot ? Math.round((row[k] || 0) / tot * 100) : 0) + '% correct of ' + tot + ' held-out samples.';
-    if (best >= 0) { txt += ' Most often mistaken for ' + label(C[best])[1] + ' (' + Math.round(bv / tot * 100) + '%).'; colHd[best].className = 'hd sel'; }
+    for (j = 0; j < N; j++) tot += +row[j] || 0;
+    for (j = 0; j < N; j++) if (j !== k && (+row[j] || 0) > bv) { bv = +row[j]; best = j; }
+    var txt = name + ': ' + (tot ? Math.round((+row[k] || 0) / tot * 100) : 0) + '% correct of ' + tot + ' held-out samples.';
+    if (best >= 0) { txt += ' Most often mistaken for ' + techFor(CLASSES[best]).english + ' (' + Math.round(bv / tot * 100) + '%).'; colHd[best].className = 'hd sel'; }
     else txt += ' No mistakes.';
     $('cmDetail').textContent = txt;
   }
 
   // ---------- gallery ----------
-  var gal = $('gallery'), galBtns = [];
-  C.forEach(function (c, k) {
-    var li = document.createElement('li'), b = document.createElement('button'), L = label(c);
-    b.type = 'button'; b.className = 'tech'; b.setAttribute('aria-pressed', 'false');
-    b.innerHTML = '<img alt="" width="100" height="120"><span class="ko"></span><span class="en"></span><span class="pc">–</span>';
-    b.querySelector('img').src = art('skeletons', c);
-    b.querySelector('.ko').textContent = L[0]; b.querySelector('.en').textContent = L[1];
-    b.setAttribute('aria-label', L[1] + ' (' + L[0] + ')');
-    b.addEventListener('click', function () { S.selected = S.selected === k ? -1 : k; galBtns.forEach(function (x, i) { x.setAttribute('aria-pressed', i === S.selected ? 'true' : 'false'); }); if (S.selected < 0) $('cmDetail').textContent = 'Tap a technique below to see what it gets mistaken for.'; renderCM(); renderDetail(); });
-    li.appendChild(b); gal.appendChild(li); galBtns.push(b);
-  });
+  var galBtns = [];
+  function buildGallery() {
+    var gal = $('gallery'); gal.innerHTML = ''; galBtns = [];
+    gal.style.setProperty('--gcols', CLASSES.length <= 9 ? CLASSES.length : 8);
+    $('galCount').textContent = CLASSES.length + ' classes · held-out accuracy per class';
+    CLASSES.forEach(function (c, k) {
+      var li = document.createElement('li'), b = document.createElement('button'), t = techFor(c);
+      b.type = 'button'; b.className = 'tech'; b.setAttribute('aria-pressed', 'false');
+      b.innerHTML = '<img alt="" width="100" height="120" loading="lazy"><span class="en"></span><span class="ko"></span><span class="pc">–</span>';
+      var im = b.querySelector('img'); imgFallback(im); im.src = art('skeletons', c);
+      b.querySelector('.en').textContent = t.english; b.querySelector('.ko').textContent = koLine(t);
+      b.setAttribute('aria-label', t.english + (t.korean ? ' (' + t.korean + ')' : ''));
+      b.addEventListener('click', function () { S.selected = S.selected === k ? -1 : k; galBtns.forEach(function (x, i) { x.setAttribute('aria-pressed', i === S.selected ? 'true' : 'false'); }); renderCM(); renderDetail(); });
+      li.appendChild(b); gal.appendChild(li); galBtns.push(b);
+    });
+    renderGalleryAcc();
+  }
   function renderGalleryAcc() {
     var E = S.lastEval; if (!E || !E.perClass) return;
-    for (var k = 0; k < N; k++) galBtns[k].querySelector('.pc').textContent = pct(E.perClass[k]);
+    for (var k = 0; k < galBtns.length; k++) galBtns[k].querySelector('.pc').textContent = pct(E.perClass[k]);
+  }
+
+  // ---------- callout ----------
+  var callout = { key: '' };
+  function showCallout(classIndex, conf, source, truthIndex) {
+    var id = CLASSES[classIndex]; if (id == null) return;
+    var t = techFor(id), key = source + ':' + classIndex;
+    var chip = $('calloutSource');
+    chip.setAttribute('data-kind', source);
+    chip.textContent = source === 'live' ? 'Live camera · the model\'s prediction' :
+      source === 'showcase' ? 'Showcase · the model\'s guess on a synthetic test skeleton' : 'Demo showcase · cycling the gallery, not model output';
+    if (callout.key !== key) {
+      var box = document.querySelector('.hero-body');
+      if (!reduced) { box.classList.remove('swap'); void box.offsetWidth; box.classList.add('swap'); }
+      var img = $('calloutImg'); imgFallback(img); img.src = art('skeletons', id); img.alt = t.english;
+      if (typeof figureFor === 'function') figureFor(classIndex);
+      $('calloutName').textContent = t.english; $('calloutName').className = 'big' + (t.english.length > 22 ? ' xlong' : t.english.length > 13 ? ' long' : ''); $('calloutKo').textContent = koLine(t) || '\u00a0';
+      callout.key = key;
+    }
+    var hasConf = conf != null && isFinite(conf);
+    $('calloutConfWrap').hidden = !hasConf;
+    if (hasConf) { $('calloutConf').textContent = Math.round(conf * 100) + '%'; $('calloutConfBar').style.width = Math.max(0, Math.min(100, conf * 100)) + '%'; }
+    var tr = $('calloutTruth');
+    if (truthIndex != null && truthIndex >= 0) { var ok = truthIndex === classIndex; tr.className = 'truth ' + (ok ? 'ok' : 'miss'); tr.textContent = (ok ? '✓ correct · ' : '✗ missed · ') + 'the skeleton was really a ' + techFor(CLASSES[truthIndex]).english.toLowerCase(); }
+    else tr.textContent = source === 'live' ? '' : '';
+  }
+
+  // Public hook for webcam.js (Waffle)
+  window.TKDUI = {
+    version: 2,
+    setLivePrediction: function (classIndex, confidence) {
+      classIndex = classIndex | 0; if (classIndex < 0 || classIndex >= CLASSES.length) return false;
+      S.liveUntil = Date.now() + 6000; showCallout(classIndex, confidence, 'live', null); return true;
+    },
+    classes: function () { return CLASSES.slice(); },
+    camSlot: function () { return $('cam-slot'); }
+  };
+
+  // Showcase: real model predictions on fresh synthetic TEST-split samples from data.js (no invented outputs).
+  var show = { i: 0, timer: null, pending: null, rng: mulberry(0x5eed), lastX: null, modelOK: null };
+  function mulberry(a) { return function () { a = (a + 0x6D2B79F5) | 0; var t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function showcaseTick() {
+    if (document.hidden || Date.now() < S.liveUntil || !CLASSES.length) return;
+    var cls = show.i++ % CLASSES.length;
+    if (B.worker && typeof TKD.generateSample === 'function' && show.modelOK !== false) {
+      try {
+        var x = TKD.generateSample(cls, show.rng, { split: 'test' });
+        var id = 'show-' + Date.now() + '-' + cls; show.pending = { id: id, cls: cls, x: x };
+        B.predict(id, x); return;
+      } catch (e) { show.modelOK = false; }
+    }
+    showCallout(cls, null, 'demo', null);
+  }
+  B.on('prediction', function (m) {
+    var p = show.pending; if (!p || m.id !== p.id) return;
+    show.pending = null;
+    if (m.ready === false || m.top == null || m.top < 0 || !m.probs || !m.probs.length) { showCallout(p.cls, null, 'demo', null); return; }
+    if (Date.now() < S.liveUntil) return;
+    show.lastX = p.x; net.inputX = p.x; net.probs = Array.prototype.slice.call(m.probs); net.probsAt = Date.now(); net.staticDirty = true; kick();
+    showCallout(m.top, m.probs[m.top], 'showcase', p.cls);
+  });
+
+  // ---------- network view ----------
+  var nc = $('netCanvas'), nctx = nc.getContext('2d');
+  var net = { layers: null, source: 'none', tensors: {}, prevW: {}, prevStep: null, params: null, edges: {}, act: {}, layout: null,
+    staticCanvas: document.createElement('canvas'), staticDirty: true, pulses: [], inputX: null, probs: null, probsAt: 0, lastExport: 0, exportBusy: false };
+
+  // (a) Optional net-info from the worker, read defensively (see NETINFO_REQUEST.md).
+  function ingestNetInfo(ni) {
+    if (!ni || typeof ni !== 'object') return;
+    if (ni.classes && ni.classes.length) setClasses(pickClasses(ni.classes));
+    if (isFinite(ni.params)) net.params = +ni.params;
+    var L = ni.layers;
+    if (L && L.length) {
+      net.layers = L.map(function (l, i) {
+        var shape = l.shape || l.outShape || null, units = +l.units || (shape && shape.length ? +shape[shape.length - 1] : 0) || 1;
+        return { name: String(l.name || l.kind || ('layer ' + i)), kind: String(l.kind || ''), units: units, shape: shape, params: isFinite(l.params) ? +l.params : null,
+          wNorm: isFinite(l.wNorm) ? +l.wNorm : null, dW: isFinite(l.dW) ? +l.dW : null };
+      });
+      net.source = 'netinfo'; net.layout = null;
+    }
+    var st = ni.stats || ni.layerStats;
+    if (st && net.layers) (st.length ? st : []).forEach(function (s, i) {
+      var l = s && s.name != null ? findLayer(s.name) : net.layers[i]; if (!l) return;
+      if (isFinite(s.wNorm)) l.wNorm = +s.wNorm; if (isFinite(s.dW)) l.dW = +s.dW;
+      if (s.act && s.act.length) net.act[l.name] = Array.prototype.slice.call(s.act, 0, 4096);
+    });
+    var acts = ni.activations;
+    if (acts && typeof acts === 'object') for (var k in acts) if (acts[k] && acts[k].length) net.act[k] = Array.prototype.slice.call(acts[k], 0, 4096);
+    net.netinfoAt = Date.now(); net.staticDirty = true; renderLayerTable(); kick();
+  }
+  function findLayer(name) { if (!net.layers) return null; for (var i = 0; i < net.layers.length; i++) if (net.layers[i].name === name) return net.layers[i]; return null; }
+  B.on('netinfo', function (m) { ingestNetInfo(m.net || m.info || m); });
+  ['ready', 'status', 'progress', 'eval'].forEach(function (t) { B.on(t, function (m) { if (m.net) ingestNetInfo(m.net); if (m.classes) setClasses(pickClasses(m.classes)); if (isFinite(m.params)) net.params = +m.params; if (isFinite(m.stepsPerSec)) S.workerStepRate = +m.stepsPerSec; if (m.modelName || m.modelVersion) net.modelName = String(m.modelName || m.modelVersion); renderReadouts(); }); });
+
+  // (b) Real weights via the contract's `export` message: tensor sizes, norms and per-step change.
+  function isTA(v) { return v && typeof v === 'object' && ArrayBuffer.isView(v) && typeof v.length === 'number'; }
+  B.on('weights', function (m) {
+    net.exportBusy = false;
+    var w = m.weights;
+    if (G.userExport) { G.userExport = false; downloadWeights(w, m.step); }
+    if (!w || typeof w !== 'object') return;
+    var step = isFinite(m.step) ? +m.step : S.step, total = 0, names = [], k;
+    for (k in w) if (isTA(w[k]) || (Array.isArray(w[k]) && typeof w[k][0] === 'number')) names.push(k);
+    if (!names.length) return;
+    var copyOK = true;
+    names.forEach(function (n) { total += w[n].length; }); if (total > 4e6) copyOK = false;
+    var dSteps = net.prevStep != null ? step - net.prevStep : 0;
+    names.forEach(function (n) {
+      var a = w[n], len = a.length, s2 = 0, sa = 0, d2 = 0, prev = net.prevW[n], i;
+      var hasPrev = prev && prev.length === len && dSteps > 0;
+      for (i = 0; i < len; i++) { var v = a[i]; s2 += v * v; sa += v < 0 ? -v : v; if (hasPrev) { var dv = v - prev[i]; d2 += dv * dv; } }
+      var t = net.tensors[n] || (net.tensors[n] = { name: n });
+      t.size = len; t.norm = Math.sqrt(s2); t.meanAbs = sa / Math.max(1, len);
+      if (hasPrev) t.dPerStep = Math.sqrt(d2) / dSteps;
+      if (copyOK) net.prevW[n] = new Float32Array(a); else delete net.prevW[n];
+    });
+    net.prevStep = step; net.params = total; net.arch = w.arch || null; net.version = w.version || null; net.tensorNames = names;
+    if (net.source !== 'netinfo') buildLayersFromWeights(w);
+    computeEdges(w);
+    net.staticDirty = true; renderReadouts(); renderLayerTable(); kick();
+  });
+
+  function downloadWeights(w, step) {
+    if (!w || typeof w !== 'object') { $('statusMsg').textContent = 'Export: no weights yet.'; return; }
+    var o = {}, k; for (k in w) o[k] = (w[k] && ArrayBuffer.isView(w[k])) ? Array.prototype.slice.call(w[k]) : w[k];
+    o.exportedStep = step; o.exportedAt = new Date().toISOString();
+    var blob = new Blob([JSON.stringify(o)], { type: 'application/json' }), url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = 'tkd-net-weights-step' + (step == null ? '' : step) + '.json'; document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1000);
+  }
+  function buildLayersFromWeights(w) {
+    var a = w.arch;
+    if (a && a.features && a.filters && a.hidden && a.classes && w.W1 && w.W2 && w.W3) { // nn.js v1 architecture
+      var J = Math.round(a.features / 2);
+      net.layers = [
+        { name: 'input', kind: 'input', units: J, shape: [a.frames, a.features], label: 'input', sub: J + ' joints × ' + a.frames + ' frames', shortLabel: 'input', shortSub: J + '×' + a.frames },
+        { name: 'conv', kind: 'conv1d', units: a.filters, shape: [a.kernel, a.features, a.filters], tensor: 'W1', label: 'conv k' + a.kernel, sub: a.filters + ' filters', shortLabel: 'conv', shortSub: a.filters + '' },
+        { name: 'pool', kind: 'pool', units: 2 * a.filters, shape: [2 * a.filters], label: 'mean+max pool', sub: 2 * a.filters + '', shortLabel: 'pool', shortSub: 2 * a.filters + '' },
+        { name: 'dense', kind: 'dense', units: a.hidden, shape: [2 * a.filters, a.hidden], tensor: 'W2', label: 'dense', sub: a.hidden + ' units', shortLabel: 'dense', shortSub: a.hidden + '' },
+        { name: 'output', kind: 'softmax', units: a.classes, shape: [a.hidden, a.classes], tensor: 'W3', label: 'softmax', sub: a.classes + ' classes', shortLabel: 'out', shortSub: a.classes + '' }];
+      net.source = 'weights-v1';
+    } else {
+      // Unknown architecture: one column per weight tensor (sizes are real, connections are not inferred).
+      var big = net.tensorNames.filter(function (n) { return net.tensors[n].size >= 128 && !/bias|beta|gamma/i.test(n); });
+      net.layers = (big.length ? big : net.tensorNames).map(function (n) {
+        return { name: n, kind: 'tensor', units: Math.max(1, Math.round(Math.sqrt(net.tensors[n].size))), tensor: n, label: n, sub: fmtInt(net.tensors[n].size) + ' w' }; });
+      net.source = 'weights-generic';
+    }
+    net.layout = null;
+  }
+  // Mean |w| between displayed node groups (v1 only, where the layout of each tensor is documented in nn.js).
+  function computeEdges(w) {
+    net.edges = {};
+    if (net.source === 'weights-v1' && !net.layout) { var rr = nc.getBoundingClientRect(); if (rr.width > 0) net.layout = netLayout(rr.width, rr.height); }
+    if (net.source !== 'weights-v1' || !net.layout) { net.edgesPending = w; return; }
+    net.edgesPending = null;
+    var a = w.arch, L = net.layout.cols, F = a.features, K = a.kernel, C = a.filters, H = a.hidden, O = a.classes;
+    function grp(u, units, shown) { return Math.min(shown - 1, Math.floor(u * shown / units)); }
+    function agg(nIn, nOut, fn) { var s = new Float32Array(nIn * nOut), c = new Float32Array(nIn * nOut); fn(function (i, o, v) { var k = i * nOut + o; s[k] += v < 0 ? -v : v; c[k]++; }); var mx = 0, i; for (i = 0; i < s.length; i++) { if (c[i]) s[i] /= c[i]; if (s[i] > mx) mx = s[i]; } if (mx > 0) for (i = 0; i < s.length; i++) s[i] /= mx; return s; }
+    var sI = L[0].shown, sC = L[1].shown, sP = L[2].shown, sH = L[3].shown, sO = L[4].shown;
+    net.edgeGroups = [sI, sC, sP, sH, sO]; net.edgesStamp = (net.edgesStamp || 0) + 1;
+    net.edges[0] = agg(sI, sC, function (add) { for (var c = 0; c < C; c++) { var gc = grp(c, C, sC); for (var k = 0; k < K; k++) for (var f = 0; f < F; f++) add(grp(f >> 1, F / 2, sI), gc, w.W1[c * K * F + k * F + f]); } });
+    net.edges[1] = agg(sC, sP, function (add) { for (var c = 0; c < C; c++) { add(grp(c, C, sC), grp(c, 2 * C, sP), 1); add(grp(c, C, sC), grp(C + c, 2 * C, sP), 1); } });
+    net.edges[2] = agg(sP, sH, function (add) { for (var h = 0; h < H; h++) for (var p = 0; p < 2 * C; p++) add(grp(p, 2 * C, sP), grp(h, H, sH), w.W2[h * 2 * C + p]); });
+    net.edges[3] = agg(sH, sO, function (add) { for (var o = 0; o < O; o++) for (var h = 0; h < H; h++) add(grp(h, H, sH), grp(o, O, sO), w.W3[o * H + h]); });
+  }
+  function requestExport() {
+    if (bridgeIsDemo() || !B.worker || document.hidden || net.exportBusy) return;
+    var now = Date.now(), every = net.params > 2e6 ? 15000 : 4000;
+    if (now - net.lastExport < every) return;
+    if (net.lastExport && S.state !== 'training') return; // one snapshot when idle is enough
+    net.lastExport = now; net.exportBusy = true; B.exportWeights();
+    setTimeout(function () { net.exportBusy = false; }, 10000);
+  }
+  function bridgeIsDemo() { return B.mode === 'demo'; }
+
+  function renderReadouts() {
+    $('rParams').textContent = fmtInt(net.params);
+    var sr = S.workerStepRate != null ? S.workerStepRate : S.stepRate;
+    $('rSteps').textContent = sr == null ? '–' : sr.toFixed(sr < 10 ? 1 : 0);
+    $('rSps').textContent = S.sps == null ? '–' : fmtInt(S.sps);
+    $('rStep').textContent = fmtInt(S.step);
+    var src = net.source === 'netinfo' ? 'live layer data from the worker' : net.source === 'viz' ? 'live activations from the worker' + (net.modelName ? ' · ' + net.modelName : '') : net.source === 'weights-v1' ? 'real weights · ' + (net.modelName || net.version || 'v1') :
+      net.source === 'weights-generic' ? 'real weight tensors · ' + (net.modelName || net.version || 'layout unknown') : bridgeIsDemo() ? 'demo mode: no network data' : 'waiting for network data';
+    $('netSource').textContent = src;
+  }
+  function renderLayerTable() {
+    var rows = [], tb = $('layerRows');
+    if ((net.source === 'netinfo' || net.source === 'viz') && net.layers) {
+      net.layers.forEach(function (l) { rows.push([l.name + (l.kind && l.kind !== l.name ? ' (' + l.kind + ')' : ''), l.shape ? l.shape.join('×') : l.units, l.params == null ? '–' : fmtInt(l.params), fmtSci(l.wNorm), fmtSci(l.dW)]); });
+    } else if (net.tensorNames) {
+      net.tensorNames.forEach(function (n) { var t = net.tensors[n]; rows.push([n, shapeOf(n), fmtInt(t.size), fmtSci(t.norm), t.dPerStep == null ? '…' : fmtSci(t.dPerStep)]); });
+    }
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">' + (bridgeIsDemo() ? 'demo mode: no network data' : 'waiting for network data') + '</td></tr>'; return; }
+    tb.innerHTML = '';
+    rows.forEach(function (r) { var tr = document.createElement('tr'); r.forEach(function (v, i) { var td = document.createElement(i ? 'td' : 'th'); if (!i) td.scope = 'row'; td.textContent = v; tr.appendChild(td); }); tb.appendChild(tr); });
+  }
+  function shapeOf(n) {
+    var a = net.arch; if (!a || net.source !== 'weights-v1') return '–';
+    var m = { W1: [a.filters, a.kernel * a.features], b1: [a.filters], W2: [a.hidden, 2 * a.filters], b2: [a.hidden], W3: [a.classes, a.hidden], b3: [a.classes] }[n];
+    return m ? m.join('×') : '–';
+  }
+
+  // Layout + static layer (nodes, real edges) is redrawn only when data changes; the per-frame overlay is just pulses.
+  function netLayout(W, H) {
+    var L = net.layers; if (!L || !L.length) return null;
+    var maxShown = W < 500 ? 10 : 16, padX = 26, padT = 18, padB = 34, n = L.length;
+    var cols = L.map(function (l, i) {
+      var shown = Math.max(1, Math.min(maxShown, l.units)), x = n === 1 ? W / 2 : padX + (W - 2 * padX) * i / (n - 1);
+      var span = H - padT - padB, gap = shown > 1 ? Math.min(22, span / (shown - 1)) : 0, y0 = padT + (span - gap * (shown - 1)) / 2, ys = [];
+      for (var k = 0; k < shown; k++) ys.push(y0 + gap * k);
+      return { x: x, ys: ys, shown: shown, layer: l, r: Math.max(2.5, Math.min(6, gap * 0.32 || 6)) };
+    });
+    return { W: W, H: H, cols: cols };
+  }
+  function layerActivity(i) { // relative weight change per step of the tensor feeding column i (0..1), real data only
+    var L = net.layers[i], v = null, mx = 0, j;
+    var all = net.layers.map(function (l) { var t = l.tensor && net.tensors[l.tensor]; return (net.source === 'netinfo' || net.source === 'viz' || l.dW != null) ? (l.dW != null && l.wNorm ? l.dW / l.wNorm : null) : (t && t.dPerStep != null && t.norm ? t.dPerStep / t.norm : null); });
+    for (j = 0; j < all.length; j++) if (all[j] != null && all[j] > mx) mx = all[j];
+    v = all[i]; return v == null || !mx ? null : v / mx;
+  }
+  function layerVals(ci) { // real values only: input = showcase sample motion, output = model probs, hidden = worker activations (viz)
+    var l = net.layers && net.layers[ci]; if (!l) return null;
+    if (net.act[l.name]) return net.act[l.name];
+    if (ci === 0 && net.inputX && net.source === 'weights-v1') return inputEnergy(net.inputX, l.units);
+    if (ci === net.layers.length - 1 && net.probs && Date.now() - net.probsAt < 8000) return net.probs;
+    return null;
+  }
+  function layerValues(ci, shown) { var out = [], v = layerVals(ci); if (!v || !v.length) return null; for (var k = 0; k < shown; k++) out.push(nodeFill(ci, k, shown, v)); return out; }
+  function nodeFill(ci, k, shown, vals) {
+    vals = vals || layerVals(ci);
+    if (!vals || !vals.length) return null;
+    var a = Math.floor(k * vals.length / shown), b = Math.max(a + 1, Math.floor((k + 1) * vals.length / shown)), s = 0, mx = 0, i;
+    for (i = a; i < b; i++) s += Math.abs(vals[i]);
+    for (i = 0; i < vals.length; i++) if (Math.abs(vals[i]) > mx) mx = Math.abs(vals[i]);
+    return mx ? (s / (b - a)) / mx : 0;
+  }
+  var energyCache = { x: null, units: 0, v: null };
+  function inputEnergy(x, J) { // per-joint movement (std of x,y over frames) of the real sample that was sent to the model
+    if (energyCache.x === x && energyCache.units === J) return energyCache.v;
+    var Fe = J * 2, T = Math.floor(x.length / Fe), out = [], j, t;
+    for (j = 0; j < J; j++) { var mx = 0, my = 0, vx = 0, vy = 0; for (t = 0; t < T; t++) { mx += x[t * Fe + 2 * j]; my += x[t * Fe + 2 * j + 1]; } mx /= T; my /= T; for (t = 0; t < T; t++) { var dx = x[t * Fe + 2 * j] - mx, dy = x[t * Fe + 2 * j + 1] - my; vx += dx * dx; vy += dy * dy; } out.push(Math.sqrt((vx + vy) / T)); }
+    energyCache = { x: x, units: J, v: out }; return out;
+  }
+  function drawStatic() {
+    net.staticDirty = false;
+    if (net.view3d) return;
+    var c = net.staticCanvas, d = nc.width / Math.max(1, nc.getBoundingClientRect().width || 1), W = nc.width / d, H = nc.height / d;
+    c.width = nc.width; c.height = nc.height; var g = c.getContext('2d'); g.setTransform(d, 0, 0, d, 0, 0); g.clearRect(0, 0, W, H);
+    if (!net.layout || net.layout.W !== W || net.layout.H !== H) { net.layout = netLayout(W, H); if (net.edgesPending && net.layout) computeEdges(net.edgesPending); }
+    var lay = net.layout, live = S.state === 'training' && B.mode === 'worker';
+    if (!lay) {
+      g.fillStyle = css('--ink-faint'); g.font = '13px ' + css('--font'); g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(bridgeIsDemo() ? 'demo mode: no network data' : 'waiting for network data', W / 2, H / 2); return;
+    }
+    var cols = lay.cols, i, k, m;
+    // edges
+    for (i = 0; i < cols.length - 1; i++) {
+      var A = cols[i], Bc = cols[i + 1], E = net.edges[i], act = layerActivity(i + 1);
+      for (k = 0; k < A.shown; k++) for (m = 0; m < Bc.shown; m++) {
+        var s = E ? E[k * Bc.shown + m] : 0.25;
+        if (E && s < 0.12) continue;
+        var alpha = (E ? 0.05 + 0.5 * s * s : 0.06) * (live ? 1 : 0.55);
+        g.strokeStyle = 'rgba(232,170,90,' + alpha.toFixed(3) + ')'; g.lineWidth = E ? 0.6 + 1.2 * s : 0.6;
+        g.beginPath(); g.moveTo(A.x, A.ys[k]); g.lineTo(Bc.x, Bc.ys[m]); g.stroke();
+      }
+    }
+    // nodes + labels
+    g.font = '10px ' + css('--mono'); g.textAlign = 'center'; g.textBaseline = 'top';
+    var anyAct = false;
+    for (i = 0; i < cols.length; i++) {
+      var col = cols[i], act2 = layerActivity(i);
+      if (act2 != null && live) { var grd = g.createRadialGradient(col.x, H / 2, 2, col.x, H / 2, 60); grd.addColorStop(0, 'rgba(226,120,60,' + (0.08 + 0.22 * act2).toFixed(3) + ')'); grd.addColorStop(1, 'rgba(226,120,60,0)'); g.fillStyle = grd; g.fillRect(col.x - 60, 0, 120, H - 30); }
+      for (k = 0; k < col.shown; k++) {
+        var f = nodeFill(i, k, col.shown), y = col.ys[k];
+        if (f != null) anyAct = true;
+        g.beginPath(); g.arc(col.x, y, col.r, 0, 6.283);
+        g.fillStyle = f == null ? '#14110f' : 'rgba(' + Math.round(90 + 150 * f) + ',' + Math.round(50 + 130 * f) + ',' + Math.round(30 + 60 * f) + ',1)';
+        g.fill(); g.lineWidth = 1.2; g.strokeStyle = f == null ? 'rgba(183,169,143,' + (live ? .55 : .3) + ')' : 'rgba(242,232,213,.8)'; g.stroke();
+      }
+      var avail = cols.length > 1 ? (W - 2 * 26) / (cols.length - 1) - 6 : W, lab = col.layer.label || col.layer.name, sub = col.layer.sub || fmtInt(col.layer.units);
+      if (W < 500 || g.measureText(lab).width > avail) lab = col.layer.shortLabel || lab;
+      if (W < 500 || g.measureText(sub).width > avail) sub = col.layer.shortSub || sub;
+      if (g.measureText(lab).width > avail) lab = fit(lab, avail);
+      if (g.measureText(sub).width > avail) sub = fit(sub, avail);
+      g.textAlign = i === 0 && cols.length > 1 ? 'left' : i === cols.length - 1 && cols.length > 1 ? 'right' : 'center';
+      var tx = i === 0 && cols.length > 1 ? Math.max(4, col.x - col.r - 2) : i === cols.length - 1 && cols.length > 1 ? Math.min(W - 4, col.x + col.r + 2) : col.x;
+      if (avail >= 24) { g.fillStyle = css('--ink-dim'); g.fillText(lab, tx, H - 30); g.fillStyle = css('--ink-faint'); g.fillText(sub, tx, H - 17); }
+      else if (i === 0) { g.textAlign = 'left'; g.fillStyle = css('--ink-faint'); g.fillText(cols.length + ' weight tensors · names in the table below', 4, H - 24); }
+    }
+    netCaption(live);
+  }
+  function fit(t, w) { var g = net.staticCanvas.getContext('2d'); while (t.length > 2 && g.measureText(t + '…').width > w) t = t.slice(0, -1); return t + '…'; }
+  function netCaption(live) {
+    var cap = [];
+    if (net.source === 'weights-v1') cap.push('Lines = mean |weight| between node groups (real, refreshed every few seconds). Column glow = how fast that layer\u2019s weights are changing.');
+    if (net.source === 'weights-generic') cap.push('Columns = the model\u2019s real weight tensors; their wiring isn\u2019t published yet, so lines are not drawn from data.');
+    if (net.source === 'netinfo') cap.push('Layer list and statistics come straight from the worker.');
+    if (net.source === 'weights-v1') cap.push(net.inputX ? 'Input = movement of each joint in the showcase skeleton; output = the model\u2019s probabilities for it.' : '');
+    cap.push(Object.keys(net.act).length ? 'Node brightness = mean |activation| from the worker (live).' : 'Hidden-layer activations: waiting for network data (hollow nodes).');
+    if (live && !net.view3d) cap.push('Moving sparks = training throughput (samples/s).');
+    if (net.view3d) cap.push('3D view: drag sideways to turn it.');
+    $('netCaption').textContent = cap.filter(Boolean).join(' ');
+  }
+  function stepPulses(dt) {
+    var lay = net.layout; if (!lay || lay.cols.length < 2) return;
+    var rate = S.sps ? Math.min(14, 2 + Math.log(1 + S.sps) * 1.4) : 0; // sparks per second, from real samples/s
+    net.spawn = (net.spawn || 0) + rate * dt;
+    while (net.spawn >= 1 && net.pulses.length < 40) { net.spawn -= 1; var c0 = 0, k = Math.floor(Math.random() * lay.cols[0].shown); net.pulses.push({ ci: c0, k: k, m: Math.floor(Math.random() * lay.cols[1].shown), t: 0 }); }
+    if (net.spawn > 1) net.spawn = 1;
+    for (var i = net.pulses.length - 1; i >= 0; i--) {
+      var p = net.pulses[i]; p.t += dt * 1.6;
+      if (p.t >= 1) { p.ci++; p.k = p.m; p.t = 0; if (p.ci >= lay.cols.length - 1) { net.pulses.splice(i, 1); continue; } p.m = Math.floor(Math.random() * lay.cols[p.ci + 1].shown); }
+    }
+  }
+  function drawNet() {
+    if (net.view3d) { if (net.staticDirty) { net.staticDirty = false; net.dataVersion = (net.dataVersion || 0) + 1; netCaption(S.state === 'training'); net.view3d.kick(); } return; }
+    var d = nc.width / Math.max(1, nc.getBoundingClientRect().width || 1), W = nc.width / d, H = nc.height / d;
+    if (net.staticDirty) drawStatic();
+    nctx.setTransform(1, 0, 0, 1, 0, 0); nctx.clearRect(0, 0, nc.width, nc.height); nctx.drawImage(net.staticCanvas, 0, 0);
+    var lay = net.layout; if (!lay || !net.pulses.length) return;
+    nctx.setTransform(d, 0, 0, d, 0, 0);
+    nctx.fillStyle = 'rgba(255,214,150,.95)';
+    for (var i = 0; i < net.pulses.length; i++) {
+      var p = net.pulses[i], A = lay.cols[p.ci], Bc = lay.cols[p.ci + 1]; if (!A || !Bc) continue;
+      var x = A.x + (Bc.x - A.x) * p.t, y = A.ys[p.k] + (Bc.ys[p.m] - A.ys[p.k]) * p.t;
+      nctx.globalAlpha = Math.sin(p.t * Math.PI) * 0.9; nctx.beginPath(); nctx.arc(x, y, 1.8, 0, 6.283); nctx.fill();
+    }
+    nctx.globalAlpha = 1;
+  }
+
+
+  // ---------- live activations: `viz` polling (feature-detected; v1 workers ignore it) ----------
+  var viz = { supported: null, sent: 0, replies: 0, timer: null, id: 0, netInView: true, tableAt: 0 };
+  function vizTick() {
+    if (viz.supported === false || B.mode !== 'worker' || !B.worker || document.hidden || S.state !== 'training' || !viz.netInView) return;
+    if (viz.sent - viz.replies > 6) { if (!viz.replies) { viz.supported = false; return; } }
+    viz.sent++; B.send({ type: 'viz', id: 'v' + (++viz.id) });
+  }
+  if (window.IntersectionObserver) new IntersectionObserver(function (es) { viz.netInView = es[0].isIntersecting; }).observe(document.querySelector('.c-net'));
+  B.on('viz', function (m) {
+    viz.replies++; viz.supported = true;
+    var src = m.fighters && m.fighters[0] ? m.fighters[0] : m, L = src.layers || (m.net && m.net.layers);
+    if (src.probs && src.probs.length) { net.probs = Array.prototype.slice.call(src.probs); net.probsAt = Date.now(); }
+    if (L && L.length) {
+      var list = L.map(function (l, i) {
+        var a = l.activations || l.act || l.values, units = +l.units || (l.shape && l.shape.length ? +l.shape[l.shape.length - 1] : 0) || (a ? a.length : 1);
+        return { name: String(l.name != null ? l.name : 'layer ' + i), kind: String(l.kind || ''), units: units, shape: l.shape || null, params: isFinite(l.params) ? +l.params : null,
+          dW: isFinite(l.weightDelta) ? +l.weightDelta : isFinite(l.dW) ? +l.dW : null, wNorm: isFinite(l.weightNorm) ? +l.weightNorm : isFinite(l.wNorm) ? +l.wNorm : null, act: a };
+      });
+      if (net.source === 'weights-v1' && net.layers && list.length === net.layers.length) {
+        list.forEach(function (v, i) { var l = net.layers[i]; if (v.act && v.act.length) net.act[l.name] = Array.prototype.slice.call(v.act, 0, 64); if (v.dW != null) l.dW = v.dW; if (v.wNorm != null) l.wNorm = v.wNorm; });
+      } else {
+        var sig = list.map(function (l) { return l.name + ':' + l.units; }).join(',');
+        if (net.source !== 'viz' || net.vizSig !== sig) { net.layers = list.map(function (l) { return { name: l.name, kind: l.kind, units: l.units, shape: l.shape, params: l.params, dW: l.dW, wNorm: l.wNorm, label: l.name }; }); net.vizSig = sig; net.source = 'viz'; net.layout = null; net.edges = {}; }
+        list.forEach(function (v, i) { var l = net.layers[i]; if (v.act && v.act.length) net.act[l.name] = Array.prototype.slice.call(v.act, 0, 64); l.dW = v.dW; l.wNorm = v.wNorm; });
+      }
+    }
+    net.staticDirty = true; kick();
+    var now = Date.now(); if (now - viz.tableAt > 1000) { viz.tableAt = now; renderLayerTable(); renderReadouts(); }
+  });
+  viz.timer = setInterval(vizTick, 150); // ~6-7 Hz while training, visible and on screen
+
+  // ---------- optional 3D layer (Three.js, lazy; the 2D page is complete without it) ----------
+  function provider3d() {
+    var L = net.layers || [];
+    return { layers: L, training: S.state === 'training' && B.mode === 'worker',
+      sig: L.map(function (l) { return l.name + ':' + l.units; }).join(',') + '|' + (net.source === 'weights-v1' ? net.edgesStamp || 0 : 0),
+      version: net.dataVersion || 0, edges: net.source === 'weights-v1' ? net.edges : null, groups: net.edgeGroups || null,
+      values: layerValues, activity: layerActivity };
+  }
+  function webglOK() { try { var c = document.createElement('canvas'); return !!(window.WebGLRenderingContext && (c.getContext('webgl2') || c.getContext('webgl'))); } catch (e) { return false; } }
+  function loadScript(src) { return new Promise(function (res, rej) { var sc = document.createElement('script'); sc.src = src; sc.async = true; sc.onload = res; sc.onerror = function () { rej(new Error('load ' + src)); }; document.head.appendChild(sc); }); }
+  var three = { state: 'idle' };
+  function load3D() {
+    if (three.state !== 'idle' || /[?&]no3d\b/.test(location.search) || !webglOK()) { if (three.state === 'idle') three.state = 'unavailable'; return; }
+    three.state = 'loading';
+    loadScript('assets/vendor/three.min.js').then(function () { return loadScript('assets/rig3d.js'); }).then(function () { return loadScript('assets/net3d.js'); }).then(function () {
+      if (!window.THREE || !window.TKD3D || !TKD3D.createNetView) throw new Error('3D scripts incomplete');
+      three.state = 'ready';
+      var btn = $('btn3d'); btn.hidden = false;
+      set3D(!reduced);
+      btn.addEventListener('click', function () { set3D(!net.view3d); });
+      maybeFigure();
+    }).catch(function (e) { three.state = 'failed'; if (window.console) console.info('[tkd-ui] staying in 2D:', e.message); });
+  }
+  function set3D(on) {
+    var wrap = document.querySelector('.net-wrap'), btn = $('btn3d');
+    if (on && !net.view3d) {
+      try { net.view3d = TKD3D.createNetView(wrap, provider3d); } catch (e) { net.view3d = null; three.state = 'failed'; btn.hidden = true; return; }
+      wrap.classList.add('is3d'); net.pulses.length = 0;
+    } else if (!on && net.view3d) { net.view3d.dispose(); net.view3d = null; wrap.classList.remove('is3d'); }
+    btn.textContent = net.view3d ? '2D view' : '3D view'; btn.setAttribute('aria-pressed', net.view3d ? 'true' : 'false');
+    net.staticDirty = true; net.layout = null; kick();
+  }
+  // 3D figure in the callout, only if Waffle's 3D poses exist (TKD.poses3d or TKD.generateSequence3D)
+  function maybeFigure() {
+    if (three.state !== 'ready' || !TKD3D.has3DPoses() || three.fig) return;
+    try { three.fig = TKD3D.createFigureView(document.querySelector('.hero-fig')); } catch (e) { three.fig = null; }
+  }
+  function figureFor(classIndex) {
+    if (!three.fig) return false;
+    var seq = TKD3D.sequenceFor(classIndex, CLASSES[classIndex], show.rng);
+    var fig = document.querySelector('.hero-fig');
+    if (seq) { three.fig.show(seq); fig.classList.add('is3d'); return true; }
+    three.fig.hide(); fig.classList.remove('is3d'); return false;
+  }
+  window.addEventListener('load', function () { var go = function () { load3D(); }; if (window.requestIdleCallback) requestIdleCallback(go, { timeout: 2500 }); else setTimeout(go, 1200); });
+
+  // ---------- frame loop: ~30 fps cap, only while something animates; stops when hidden ----------
+  var raf = 0, lastT = 0, frameTimes = [];
+  function animating() { return !net.view3d && !document.hidden && !reduced && S.state === 'training' && B.mode === 'worker' && !!net.layout; }
+  function frame(t) {
+    raf = 0;
+    if (document.hidden) return;
+    var dt = lastT ? Math.min(0.1, (t - lastT) / 1000) : 0;
+    if (!animating() || t - lastT >= 33) {
+      var t0 = performance.now();
+      lastT = t;
+      if (animating()) stepPulses(dt); else net.pulses.length = 0;
+      if (lossDirty) drawLoss();
+      drawNet();
+      frameTimes.push(performance.now() - t0); if (frameTimes.length > 120) frameTimes.shift();
+    }
+    if (animating() || lossDirty || net.staticDirty) raf = requestAnimationFrame(frame);
+  }
+  function kick() { if (!raf && !document.hidden) raf = requestAnimationFrame(frame); }
+  window.__tkdFrameStats = function () { var a = frameTimes.slice().sort(function (x, y) { return x - y; }); return { n: a.length, median: a[a.length >> 1] || 0, p95: a[Math.floor(a.length * .95)] || 0 }; };
+  function onResize() { var a = sizeCanvas(cv), b = sizeCanvas(nc); if (a) lossDirty = true; if (b) { net.layout = null; net.staticDirty = true; } kick(); }
+  if (window.ResizeObserver) { var ro = new ResizeObserver(onResize); ro.observe(cv); ro.observe(nc); } else window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', function () { setTimeout(onResize, 200); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { lastT = 0; net.staticDirty = true; lossDirty = true; kick(); } });
+
+
+  // ---------- reset guard + save-on-leave (QA fixes) ----------
+  // After `reset`, drop in-flight progress/eval/status/saved/weights/netinfo until the ack arrives.
+  // v2: messages carry `epoch`; anything older than the latest acknowledged epoch is dropped.
+  // v1: no epoch; the fresh `ready {restored:false}` after reset is the ack. A 3 s timeout clears the flag anyway.
+  var G = { resetPending: false, resetTimer: null, ackEpoch: null, userPaused: false, autoPaused: false, flushSupported: false, userExport: false };
+  var STALE_TYPES = { progress: 1, eval: 1, status: 1, saved: 1, weights: 1, netinfo: 1, viz: 1, prediction: 1 };
+  function clearResetPending() { G.resetPending = false; if (G.resetTimer) { clearTimeout(G.resetTimer); G.resetTimer = null; } }
+  B.filter = function (m) {
+    if (!m || typeof m !== 'object') return false;
+    var isAck = m.type === 'ready' || m.type === 'resetDone' || m.type === 'resetAck' || m.type === 'reset-ack' || m.type === 'reset';
+    if (isFinite(m.epoch)) {
+      if (isAck) { if (G.ackEpoch == null || m.epoch >= G.ackEpoch) { G.ackEpoch = +m.epoch; clearResetPending(); } return m.type === 'ready'; }
+      if (G.ackEpoch != null && m.epoch < G.ackEpoch) return false;
+      if (G.resetPending && STALE_TYPES[m.type]) return false;
+      return true;
+    }
+    if (isAck) { clearResetPending(); return m.type === 'ready'; }
+    if (G.resetPending && STALE_TYPES[m.type]) return false;
+    return true;
+  };
+  function sendReset() {
+    G.resetPending = true; G.userPaused = false; G.autoPaused = false; G.userExport = false; if (G.resetTimer) clearTimeout(G.resetTimer);
+    G.resetTimer = setTimeout(clearResetPending, 3000);
+    B.reset();
+  }
+  // Save on leave: `flush` (v2) is always sent (v1 ignores it); `pause` (saves in v1 per CONTRACT) unless the worker said it supports flush.
+  function saveOnLeave() {
+    if (!B.worker || B.mode !== 'worker') return;
+    B.flush();
+    if (!G.flushSupported && S.state === 'training' && !G.userPaused) { G.autoPaused = true; B.pause(); }
+  }
+  function backOnScreen() {
+    if (G.autoPaused && !G.userPaused && B.worker) { G.autoPaused = false; B.resume(); }
+  }
+  window.addEventListener('pagehide', saveOnLeave);
+  document.addEventListener('visibilitychange', function () { if (document.hidden) saveOnLeave(); else backOnScreen(); });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) backOnScreen(); });
+  function readCaps(m) {
+    var caps = m.supports || m.features || m.capabilities;
+    if ((caps && caps.indexOf && caps.indexOf('flush') >= 0) || m.flush === true) G.flushSupported = true;
   }
 
   // ---------- worker messages ----------
-  function pushProgress(m) { S.progress.push({ step: m.step, loss: m.loss, lossEMA: m.lossEMA }); if (S.progress.length > MAXPTS) S.progress.splice(0, S.progress.length - MAXPTS); dirty = true; }
-  function pushEval(m) { S.evals.push({ step: m.step, loss: m.loss, acc: m.acc }); if (S.evals.length > MAXPTS) S.evals.shift(); dirty = true; }
+  function pushProgress(m) { S.progress.push({ step: m.step, loss: m.loss, lossEMA: m.lossEMA }); if (S.progress.length > MAXPTS) S.progress.splice(0, S.progress.length - MAXPTS); lossDirty = true; kick(); }
+  function pushEval(m) { S.evals.push({ step: m.step, loss: m.loss, acc: m.acc }); if (S.evals.length > MAXPTS) S.evals.shift(); lossDirty = true; kick(); }
 
   B.on('noworker', function () { $('noWorker').hidden = false; setStatus('error', 'Web Workers unavailable'); });
   B.on('ready', function (m) {
+    readCaps(m);
     S.running = true; S.step = m.steps || 0; $('mStep').textContent = S.step;
-    if (!m.restored) { S.progress = []; S.evals = []; dirty = true; } // history belongs to discarded weights
+    if (!m.restored) { S.progress = []; S.evals = []; lossDirty = true; }
+    net.prevW = {}; net.prevStep = null; net.lastExport = 0;
     $('sessionInfo').textContent = (m.restored ? 'resumed' : 'fresh start') + ' · session ' + (m.sessions || 1);
-    $('btnReset').disabled = false;
+    $('btnReset').disabled = false; $('btnExport').disabled = false; renderReadouts();
   });
-  B.on('status', function (m) { setStatus(m.state, m.message); });
+  B.on('status', function (m) { setStatus(m.state, m.message); if (m.state === 'training') requestExport(); });
   B.on('progress', function (m) {
+    var now = performance.now();
+    if (S.lastProg && m.step > S.lastProg.step) { var r = (m.step - S.lastProg.step) / Math.max(0.001, (now - S.lastProg.t) / 1000); S.stepRate = S.stepRate == null ? r : S.stepRate * 0.8 + r * 0.2; }
+    S.lastProg = { step: m.step, t: now };
     S.step = m.step; $('mStep').textContent = m.step;
-    $('mSps').textContent = m.samplesPerSec != null ? Math.round(m.samplesPerSec) : '–';
-    $('lossNow').textContent = (m.lossEMA != null ? m.lossEMA : m.loss).toFixed(3);
-    setTrain(m.accEMA != null ? m.accEMA : m.acc, m.step);
-    pushProgress(m);
+    if (isFinite(m.samplesPerSec)) S.sps = +m.samplesPerSec;
+    var le = isFinite(m.lossEMA) ? m.lossEMA : m.loss; $('lossNow').textContent = isFinite(le) ? (+le).toFixed(3) : '';
+    setStat('Train', isFinite(m.accEMA) ? m.accEMA : m.acc, m.step);
+    pushProgress(m); renderReadouts(); requestExport();
     if (S.state !== 'training' && S.state !== 'paused') setStatus('training');
   });
-  B.on('eval', function (m) { S.lastEval = m; setHeld(m.acc, m.step); pushEval(m); renderCM(); });
-  B.on('saved', function (m) { var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + ' · ' + (m.bytes != null ? (m.bytes / 1024).toFixed(0) + ' KB · ' : '') + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
+  B.on('eval', function (m) {
+    if (m.confusion && m.confusion.length && m.confusion.length !== CLASSES.length) setClasses(pickClasses(null, m.confusion.length));
+    S.lastEval = m; setStat('Held', m.acc, m.step); pushEval(m); renderCM();
+  });
+  B.on('saved', function (m) { if (m.flush === true) G.flushSupported = true; });
+  B.on('saved', function (m) { var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + (m.bytes != null ? ' · ' + (m.bytes / 1024).toFixed(0) + ' KB' : '') + ' · ' + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
   B.on('error', function (m) { setStatus('error', m.message); });
 
-  $('btnPause').addEventListener('click', function () { if (S.state === 'paused') B.resume(); else B.pause(); });
+  $('btnPause').addEventListener('click', function () { if (S.state === 'paused') { G.userPaused = false; G.autoPaused = false; B.resume(); } else { G.userPaused = true; B.pause(); } });
+  $('btnExport').addEventListener('click', function () { G.userExport = true; net.exportBusy = false; B.exportWeights(); });
   $('btnReset').addEventListener('click', function () {
     if (!confirm('Forget everything the network has learned and start from scratch?')) return;
-    S.progress = []; S.evals = []; S.lastEval = null; dirty = true; setTrain(NaN, '–'); setHeld(NaN, '–');
-    $('cmStep').textContent = 'no eval yet'; $('mSaved').textContent = 'not saved yet';
-    cells.forEach(function (r) { r.forEach(function (c) { c.style.background = ''; c.textContent = ''; }); });
-    galBtns.forEach(function (b) { b.querySelector('.pc').textContent = '–'; });
-    B.reset();
+    S.progress = []; S.evals = []; S.lastEval = null; lossDirty = true; setStat('Train', NaN, null); setStat('Held', NaN, null);
+    $('mSaved').textContent = 'not saved yet'; buildCM(); buildGallery(); net.prevW = {}; net.prevStep = null; S.lastProg = null; S.stepRate = null; sendReset(); kick();
   });
 
-  // ---------- previous curve from IndexedDB (store.js in page, optional) ----------
+  // ---------- boot ----------
   function loadHistory() {
     try {
       if (!TKD.store || !TKD.store.loadHistory) return Promise.resolve(null);
       return Promise.resolve(TKD.store.loadHistory()).then(function (h) {
         if (!h) return;
-        var prog = h.progress || (Array.isArray(h) ? h : []), ev = h.eval || h.evals || [];
+        var prog = h.progress || [], ev = h.evals || h.eval || [];
         prog.forEach(function (p) { if (p && p.step != null) pushProgress(p); });
         ev.forEach(function (e) { if (e && e.step != null) pushEval(e); });
-        if (prog.length) { var lp = prog[prog.length - 1]; setTrain(lp.accEMA != null ? lp.accEMA : lp.acc, lp.step); }
-        if (ev.length) { var le = ev[ev.length - 1]; setHeld(le.acc, le.step); if (le.confusion) { S.lastEval = le; renderCM(); } }
+        if (prog.length) { var lp = prog[prog.length - 1]; setStat('Train', isFinite(lp.accEMA) ? lp.accEMA : lp.acc, lp.step); }
+        if (ev.length) { var le = ev[ev.length - 1]; setStat('Held', le.acc, le.step); }
       }).catch(function () {});
     } catch (e) { return Promise.resolve(null); }
   }
-
-  setStatus('loading');
-  var booted = false; function boot() { if (booted) return; booted = true; if (B.connect()) B.start(); }
-  Promise.race([loadHistory(), new Promise(function (r) { setTimeout(r, 1500); })]).then(boot, boot);
-  document.addEventListener('visibilitychange', function () { dirty = true; });
+  function loadTechniques() {
+    if (!window.fetch) return Promise.resolve();
+    return fetch('assets/techniques.json').then(function (r) { return r.ok ? r.json() : null; }).then(function (list) {
+      if (!list || !list.length) return;
+      list.forEach(function (t) { addTech({ id: t.id || t.classId, slug: t.slug || t.file, english: t.english, korean: t.korean, hangul: t.hangul, icon: t.icon, skeleton: t.skeleton }); });
+    }).catch(function () {});
+  }
+  setClasses(pickClasses());
+  setStatus('loading'); renderReadouts(); onResize();
+  var booted = false;
+  function boot() {
+    if (booted) return; booted = true;
+    buildCM(); buildGallery(); showCallout(0, null, 'demo', null);
+    if (B.connect()) B.start();
+    show.timer = setInterval(showcaseTick, 3200); setTimeout(showcaseTick, 1200);
+  }
+  Promise.race([Promise.all([loadHistory(), loadTechniques()]), new Promise(function (r) { setTimeout(r, 1500); })]).then(boot, boot);
 })();
 </script>
 </body>
