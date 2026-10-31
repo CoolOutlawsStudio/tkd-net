@@ -218,7 +218,7 @@
     $(p + '0').textContent = fmtInt(m.updates); $(p + '1').textContent = fx(m.entropy, 3); $(p + '2').textContent = fx(m.approxKl, 4); $(p + '3').textContent = fx(m.clipFrac, 2);
   });
   B.on('elo', function (m) {
-    if (!isFinite(m.a) || !isFinite(m.b)) return;
+    if (m.a == null || m.b == null || !isFinite(m.a) || !isFinite(m.b)) return; // null/undefined = missing, not 0
     S.elo.push({ rounds: +m.rounds || S.elo.length, a: +m.a, b: +m.b, at: +m.at || Date.now() }); if (S.elo.length > 1000) S.elo.shift();
     eloDirty = true; kick();
     if (!S.eloFirst) S.eloFirst = { a: +m.a, b: +m.b, at: +m.at || Date.now(), train: S.trainSec };
@@ -229,12 +229,12 @@
   // Honest Elo summary: plain change since the first measurement. A per-hour average is shown only after
   // RATE_MIN_MS of training and only when neither fighter sits at the benchmark cap (a capped Elo cannot move).
   function eloSummary(f, l, capA, capB) {
-    if (!f || !l || l === f || l.at === f.at && l.a === f.a && l.b === f.b) return 'first measurement; change since start appears after the next one';
+    if (!f || !l || l === f || l.at === f.at && l.a === f.a && l.b === f.b) return 'first measurement since you opened this page; the change appears after the next one';
     var ms = (f.train != null && S.trainSec != null) ? (S.trainSec - f.train) * 1000 : 0;
     if (!(ms > 0)) ms = Math.max(0, l.at - f.at);
-    var mins = ms / 60000, dur = mins < 1 ? Math.max(1, Math.round(ms / 1000)) + ' s' : mins < 120 ? Math.round(mins) + ' min' : (mins / 60).toFixed(1) + ' h';
+    var mins = ms / 60000, dur = mins < 1 ? Math.max(1, Math.floor(ms / 1000)) + ' s' : mins < 120 ? Math.floor(mins) + ' min' : (Math.floor(mins / 6) / 10).toFixed(1) + ' h'; // floored, never overstates
     function one(name, d, c) { return name + ' ' + sgn(d) + (c ? ' (at benchmark cap)' : ''); }
-    var txt = 'change since start (' + dur + ' of training): ' + one('Blue', l.a - f.a, capA) + ' · ' + one('Gold', l.b - f.b, capB);
+    var txt = 'change since you opened this page (' + dur + ' of training): ' + one('Blue', l.a - f.a, capA) + ' · ' + one('Gold', l.b - f.b, capB);
     if (ms >= RATE_MIN_MS && !capA && !capB) { var h = ms / 3600000; txt += ' · average so far: Blue ' + sgn((l.a - f.a) / h) + '/h · Gold ' + sgn((l.b - f.b) / h) + '/h (not a forecast)'; }
     return txt;
   }

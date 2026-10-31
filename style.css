@@ -228,3 +228,12 @@ footer{position:relative;z-index:1;text-align:center;font-size:.72rem;color:var(
   .brand{gap:8px}.brand img{width:32px;height:32px}.brand .txt{overflow:hidden}.brand h1{font-size:1rem;letter-spacing:.08em}.brand h1 .seal{display:none}.status{padding:0 10px}}
 @media (max-width:360px){.arena-link{padding:0 10px}}
 @media (prefers-reduced-motion:reduce){.arena-link{transition:none}}
+
+/* Narrow header: title shrinks, then ellipsizes cleanly (no mid-letter clip); link + status stay 44 px */
+@media (max-width:560px){
+  .brand .txt{flex:1 1 auto;min-width:0;overflow:hidden}
+  .brand h1{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .brand h1 .dash{margin:0 .04em}
+}
+@media (max-width:420px){.brand h1{font-size:.95rem;letter-spacing:.05em}.brand{gap:6px}.status{padding:0 8px;gap:6px}.arena-link{padding:0 10px;gap:4px}}
+@media (max-width:360px){.brand img{width:28px;height:28px}.top{gap:6px}}
