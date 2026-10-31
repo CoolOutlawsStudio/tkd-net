@@ -115,6 +115,7 @@
     elo: [], actions: [], rounds: 0, wins: [0, 0, 0], lastEnd: null, sparks: [] };
 
   // ---------- status / controls ----------
+  var ELO_CAP = 2699, RATE_MIN_MS = 10 * 60 * 1000; // benchmark Elo ceiling; min training before any per-hour figure
   var STATE_TEXT = { loading: 'Loading…', running: 'Fighting now', paused: 'Paused', error: 'Error' };
   function setStatus(st, msg) {
     S.state = st; $('status').setAttribute('data-state', st); $('statusText').textContent = STATE_TEXT[st] || st;
@@ -130,7 +131,7 @@
   $('practice').addEventListener('change', function (e) { B.send({ type: 'practice', on: !!e.target.checked }); });
   $('btnReset').addEventListener('click', function () {
     if (!confirm('Reset the arena? Both fighters forget everything they learned, and the Elo history is cleared.')) return;
-    S.elo = []; S.prev = S.cur = null; S.lastStep = -1; S.wins = [0, 0, 0]; S.sparks.length = 0; eloDirty = true; $('eloGain').textContent = 'waiting for the worker\'s benchmark'; $('eloNow').textContent = '';
+    S.elo = []; S.eloFirst = null; S.trainSec = null; S.prev = S.cur = null; S.lastStep = -1; S.wins = [0, 0, 0]; S.sparks.length = 0; eloDirty = true; $('eloGain').textContent = 'waiting for the worker\'s benchmark'; $('eloNow').textContent = '';
     B.reset();
   });
   // ---------- save on leave (contract: `flush` -> worker replies `saved {rounds, bytes, at}`) ----------
@@ -177,7 +178,7 @@
     $('sRounds').textContent = fmtInt(S.rounds);
     $('practice').disabled = B.mode === 'demo';
   });
-  B.on('resetDone', function () { S.elo = []; eloDirty = true; });
+  B.on('resetDone', function () { S.elo = []; S.eloFirst = null; S.trainSec = null; eloDirty = true; });
   B.on('status', function (m) {
     var st = m.state === 'running' ? 'running' : m.state;
     setStatus(st, m.message);
@@ -206,6 +207,7 @@
     showBanner(txt, 'Round ' + (m.round || '') + (why ? ' · ' + why : '') + (m.hits ? ' · hits ' + m.hits[0] + '–' + m.hits[1] : ''), w);
   });
   B.on('stats', function (m) {
+    if (isFinite(m.trainSeconds)) { S.trainSec = +m.trainSeconds; if (S.eloFirst && S.eloFirst.train == null) S.eloFirst.train = S.trainSec; }
     if (isFinite(m.roundsPerSec)) $('sRps').textContent = (+m.roundsPerSec).toFixed(2);
     if (isFinite(m.stepsPerSec)) $('sSps').textContent = fmtInt(m.stepsPerSec);
     if (isFinite(m.practiceRounds)) $('sPractice').textContent = fmtInt(m.practiceRounds);
@@ -219,12 +221,23 @@
     if (!isFinite(m.a) || !isFinite(m.b)) return;
     S.elo.push({ rounds: +m.rounds || S.elo.length, a: +m.a, b: +m.b, at: +m.at || Date.now() }); if (S.elo.length > 1000) S.elo.shift();
     eloDirty = true; kick();
-    $('eloNow').textContent = 'now: Blue ' + Math.round(m.a) + ' · Gold ' + Math.round(m.b);
-    if (S.elo.length >= 2) {
-      var f = S.elo[0], l = S.elo[S.elo.length - 1], hrs = (l.at - f.at) / 3600000;
-      $('eloGain').textContent = hrs > 1 / 60 ? 'gain per hour of training: Blue ' + sgn((l.a - f.a) / hrs) + ' · Gold ' + sgn((l.b - f.b) / hrs) : 'measuring…';
-    }
+    if (!S.eloFirst) S.eloFirst = { a: +m.a, b: +m.b, at: +m.at || Date.now(), train: S.trainSec };
+    var cap = isFinite(m.cap) ? +m.cap : ELO_CAP, capA = +m.a >= cap - 0.5, capB = +m.b >= cap - 0.5;
+    $('eloNow').textContent = 'now: Blue ' + Math.round(m.a) + (capA ? ' (cap)' : '') + ' · Gold ' + Math.round(m.b) + (capB ? ' (cap)' : '');
+    $('eloGain').textContent = eloSummary(S.eloFirst, S.elo[S.elo.length - 1], capA, capB);
   });
+  // Honest Elo summary: plain change since the first measurement. A per-hour average is shown only after
+  // RATE_MIN_MS of training and only when neither fighter sits at the benchmark cap (a capped Elo cannot move).
+  function eloSummary(f, l, capA, capB) {
+    if (!f || !l || l === f || l.at === f.at && l.a === f.a && l.b === f.b) return 'first measurement; change since start appears after the next one';
+    var ms = (f.train != null && S.trainSec != null) ? (S.trainSec - f.train) * 1000 : 0;
+    if (!(ms > 0)) ms = Math.max(0, l.at - f.at);
+    var mins = ms / 60000, dur = mins < 1 ? Math.max(1, Math.round(ms / 1000)) + ' s' : mins < 120 ? Math.round(mins) + ' min' : (mins / 60).toFixed(1) + ' h';
+    function one(name, d, c) { return name + ' ' + sgn(d) + (c ? ' (at benchmark cap)' : ''); }
+    var txt = 'change since start (' + dur + ' of training): ' + one('Blue', l.a - f.a, capA) + ' · ' + one('Gold', l.b - f.b, capB);
+    if (ms >= RATE_MIN_MS && !capA && !capB) { var h = ms / 3600000; txt += ' · average so far: Blue ' + sgn((l.a - f.a) / h) + '/h · Gold ' + sgn((l.b - f.b) / h) + '/h (not a forecast)'; }
+    return txt;
+  }
   B.on('saved', function (m) { var ws = savedWaiters.slice(); for (var i = 0; i < ws.length; i++) ws[i](true); });
   B.on('saved', function (m) { $('sSaved').textContent = (m.ok === false ? 'failed' : new Date(m.at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })); });
   function fmtInt(n) { if (n == null || !isFinite(n)) return '–'; n = Math.round(n); return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n); }

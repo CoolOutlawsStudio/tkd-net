@@ -94,6 +94,7 @@
       <p>A neural network learning taekwondo, live in your browser</p>
     </div>
   </div>
+  <a id="arenaLink" class="arena-link" href="arena.html" aria-label="Arena: 2 AIs fight and learn (opens the arena page)"><span class="al-ico" aria-hidden="true">⚔</span><span class="al-t">Arena<span class="al-sub">: 2 AIs fight</span></span></a>
   <div id="status" class="status" data-state="loading" role="status" aria-live="polite">
     <span class="dot" aria-hidden="true"></span><span id="statusText">Loading…</span>
   </div>
@@ -975,6 +976,22 @@
   function backOnScreen() {
     if (G.autoPaused && !G.userPaused && B.worker) { G.autoPaused = false; B.resume(); }
   }
+  // Leaving via an in-page link (Arena): send `flush`, wait for the worker's `saved {flush:true}` (max 1.5 s), then go.
+  var leaveWaiters = [], leaving = false;
+  function flushThen(go) {
+    if (!B.worker || B.mode !== 'worker') { go(); return; }
+    var done = false, fin = function () { if (done) return; done = true; var i = leaveWaiters.indexOf(fin); if (i >= 0) leaveWaiters.splice(i, 1); go(); };
+    leaveWaiters.push(fin); setTimeout(fin, 1500); saveOnLeave();
+  }
+  $('arenaLink').addEventListener('click', function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; // new tab etc.: trainer keeps running
+    if (!B.worker || B.mode !== 'worker') return;
+    e.preventDefault();
+    if (leaving) return;
+    leaving = true; var a = e.currentTarget, href = a.href; a.setAttribute('aria-busy', 'true'); $('mSaved').textContent = 'saving before leaving…';
+    flushThen(function () { location.href = href; });
+  });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) { leaving = false; $('arenaLink').removeAttribute('aria-busy'); } });
   window.addEventListener('pagehide', saveOnLeave);
   document.addEventListener('visibilitychange', function () { if (document.hidden) saveOnLeave(); else backOnScreen(); });
   window.addEventListener('pageshow', function (e) { if (e.persisted) backOnScreen(); });
@@ -1020,7 +1037,7 @@
     if (m.confusion && m.confusion.length && m.confusion.length !== CLASSES.length) setClasses(pickClasses(null, m.confusion.length));
     S.lastEval = m; setStat('Held', m.acc, m.step); pushEval(m); renderCM();
   });
-  B.on('saved', function (m) { if (m.flush === true) { G.flushSupported = true; if (SZ.waitFlush) SZ.waitFlush(); } if (m.ok === false) { $('mSaved').textContent = 'not saved: storage unavailable in this browser'; } });
+  B.on('saved', function (m) { if (m.flush === true) { G.flushSupported = true; if (SZ.waitFlush) SZ.waitFlush(); leaveWaiters.slice().forEach(function (f) { f(); }); } if (m.ok === false) { $('mSaved').textContent = 'not saved: storage unavailable in this browser'; } });
   B.on('saved', function (m) { if (m.ok === false) return; var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + (m.bytes != null ? ' · ' + (m.bytes / 1024).toFixed(0) + ' KB' : '') + ' · ' + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
   B.on('error', function (m) { setStatus('error', m.message); });
 
