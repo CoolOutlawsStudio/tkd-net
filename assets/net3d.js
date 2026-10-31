@@ -5,10 +5,16 @@
   'use strict';
   var TKD3D = root.TKD3D = root.TKD3D || {};
 
-  TKD3D.createNetView = function (container, provider) {
+  // Perf guard: refuse software / "major performance caveat" WebGL unless the user opted in; cap fps (30 desktop, 20 phones).
+  function phone() { var ua = (root.navigator && navigator.userAgent) || '', coarse = !!(root.matchMedia && matchMedia('(pointer: coarse)').matches); return /iPhone|iPod|Android.*Mobile|Windows Phone/i.test(ua) || (coarse && Math.min(screen.width || 9999, screen.height || 9999) < 700); }
+  TKD3D.FRAME_MS = phone() ? 50 : 33;
+  TKD3D.rendererOpts = function (extra, allowSoftware) { var o = { antialias: !phone(), powerPreference: 'low-power', failIfMajorPerformanceCaveat: !allowSoftware }; for (var k in extra) o[k] = extra[k]; return o; };
+
+  TKD3D.createNetView = function (container, provider, opts) {
+    opts = opts || {};
     var THREE = root.THREE;
     var reduced = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
-    var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'low-power' });
+    var renderer = new THREE.WebGLRenderer(TKD3D.rendererOpts({ alpha: true }, opts.allowSoftware));
     renderer.setPixelRatio(Math.min(1.75, root.devicePixelRatio || 1));
     renderer.setClearColor(0x000000, 0);
     var canvas = renderer.domElement; canvas.className = 'net3d'; canvas.setAttribute('aria-hidden', 'true');
@@ -26,8 +32,10 @@
     function size() {
       var w = container.clientWidth || 300, h = container.clientHeight || 260;
       renderer.setSize(w, h, false); canvas.style.width = '100%'; canvas.style.height = '100%';
-      camera.aspect = w / h; camera.updateProjectionMatrix();
+      camera.aspect = w / h; camera.updateProjectionMatrix(); if (typeof fit === 'function') fit(lastSpan);
     }
+    var lastSpan = 6;
+    function fit(span) { lastSpan = span; var t = Math.tan(camera.fov * Math.PI / 360), need = Math.max((span / 2 + 1.6) / (t * camera.aspect), 1.9 / t); camera.position.set(0, 1.4, need); camera.lookAt(0, 0, 0); }
     function clear() {
       if (!built) return;
       world.remove(built.group);
@@ -74,7 +82,7 @@
       }
       world.add(group);
       built = { group: group, layers: layers, sig: st.sig };
-      camera.position.set(0, 1.6, Math.max(5.5, span * 0.95 + 2.6));
+      fit(span);
     }
     function paint(st) {
       if (!built) return;
@@ -95,7 +103,7 @@
       raf = 0; if (disposed) return;
       var st = provider();
       var animate = st.training && visible && inView && !reduced;
-      if (animate && t - lastT < 33) { raf = requestAnimationFrame(frame); return; }
+      if (animate && t - lastT < TKD3D.FRAME_MS - 1) { raf = requestAnimationFrame(frame); return; }
       var dt = lastT ? Math.min(0.1, (t - lastT) / 1000) : 0; lastT = t;
       if (!built || built.sig !== st.sig) build(st);
       if (st.version !== version) { version = st.version; paint(st); }
@@ -120,23 +128,25 @@
   };
 
   // Small rotating 3D figure for the callout (only when 3D poses exist).
-  TKD3D.createFigureView = function (container) {
+  TKD3D.createFigureView = function (container, opts) {
+    opts = opts || {};
     var THREE = root.THREE;
     var reduced = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
-    var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'low-power' });
+    var renderer = new THREE.WebGLRenderer(TKD3D.rendererOpts({ alpha: true }, opts.allowSoftware));
     renderer.setPixelRatio(Math.min(1.75, root.devicePixelRatio || 1)); renderer.setClearColor(0, 0);
     var canvas = renderer.domElement; canvas.className = 'fig3d'; canvas.setAttribute('aria-hidden', 'true'); container.appendChild(canvas);
     var scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(35, 1, 0.1, 50);
     scene.add(new THREE.HemisphereLight(0xfff1e0, 0x1a1008, 1.1)); var key = new THREE.DirectionalLight(0xffd2a0, 0.9); key.position.set(2, 3, 2); scene.add(key);
     var rig = new TKD3D.Rig(THREE, {}); scene.add(rig.group);
-    var seq = null, flip = true, t0 = 0, raf = 0, lastT = 0, visible = true;
+    var seq = null, clip = null, flip = true, t0 = 0, raf = 0, lastT = 0, visible = true;
     camera.position.set(0, 0.4, 5.2); camera.lookAt(0, 0.2, 0);
     function size() { var w = container.clientWidth || 160, h = container.clientHeight || 200; renderer.setSize(w, h, false); canvas.style.width = '100%'; canvas.style.height = '100%'; camera.aspect = w / h; camera.updateProjectionMatrix(); }
     function frame(t) {
       raf = 0; if (!seq) return;
-      if (t - lastT < 33) { raf = requestAnimationFrame(frame); return; } lastT = t;
-      var fps = 12, i = reduced ? Math.floor(seq.length * 0.45) : Math.floor(((t - t0) / 1000) * fps) % seq.length;
-      rig.setPose(seq[i], flip); rig.group.rotation.y = reduced ? 0.5 : 0.5 + Math.sin((t - t0) / 2600) * 0.5;
+      if (t - lastT < TKD3D.FRAME_MS - 1) { raf = requestAnimationFrame(frame); return; } lastT = t;
+      var fps = (clip && clip.fps) || 12, i = reduced ? Math.floor(seq.length * 0.45) : Math.floor(Math.max(0, (t - t0) / 1000) * fps) % seq.length;
+      rig.setPose(seq[i], flip);
+      var rY = clip && clip.rootY; rig.group.position.y = rY ? (flip ? -1 : 1) * (rY[i] - rY[0]) : 0; rig.group.rotation.y = reduced ? 0.5 : 0.5 + Math.sin((t - t0) / 2600) * 0.5;
       renderer.render(scene, camera);
       if (!reduced && visible) raf = requestAnimationFrame(frame);
     }
@@ -144,8 +154,9 @@
     if (root.ResizeObserver) new ResizeObserver(size).observe(container);
     size();
     return {
-      show: function (sequence) { seq = sequence; flip = TKD3D.isYDown(sequence); t0 = performance.now(); if (!raf) raf = requestAnimationFrame(frame); },
+      show: function (c) { clip = c && c.frames ? c : { frames: c, fps: 12 }; seq = clip.frames; flip = TKD3D.isYDown(seq); t0 = performance.now(); if (!raf) raf = requestAnimationFrame(frame); },
       hide: function () { seq = null; },
+      dispose: function () { seq = null; renderer.dispose(); canvas.remove(); },
       canvas: canvas
     };
   };

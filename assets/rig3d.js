@@ -54,16 +54,22 @@
     this.dispose = function () { cyl.dispose(); sph.dispose(); head.dispose(); matB.dispose(); matL.dispose(); };
   };
 
-  // Find a 3D sequence for class index i: TKD.poses3d (keyed by id/slug/index) or TKD.generateSequence3D.
-  TKD3D.sequenceFor = function (i, classId, rng) {
-    var T = root.TKD || {}, P = T.poses3d, s = null;
-    if (P) s = P[classId] || P[String(classId).replace(/_/g, '-')] || P[i] || null;
-    if (s && s.frames) s = s.frames;
-    if (!s && typeof T.generateSequence3D === 'function') {
-      try { var r = T.generateSequence3D(i, rng || Math.random, {}); s = r && (r.frames || r); } catch (e) { s = null; }
-      if (s && s.length && typeof s[0] === 'number') { var J = 17 * 3, n = Math.floor(s.length / J), out = []; for (var f = 0; f < n; f++) out.push(Array.prototype.slice.call(s, f * J, f * J + J)); s = out; }
-    }
-    return s && s.length ? s : null;
+  // Find a 3D clip for class index i -> { frames: [Float32Array(51) per frame], fps, rootY|null } or null.
+  // Sources (feature-detected): TKD.poses3d[id|slug|index] clip objects ({frames flat, frameCount, fps, rootY}) or
+  // arrays of frames, then TKD.generateSequence3D(i, rng) -> { frames, nFrames, fps, rootY }.
+  function asClip(c) {
+    if (!c) return null;
+    var fr = c.frames || c, fps = c.fps || 12, rootY = c.rootY || null, out = [], J = 51, n;
+    if (fr && typeof fr.length === 'number' && (typeof fr[0] === 'number')) { n = c.frameCount || c.nFrames || Math.floor(fr.length / J); for (var f = 0; f < n; f++) out.push(fr.subarray ? fr.subarray(f * J, f * J + J) : fr.slice(f * J, f * J + J)); }
+    else if (fr && fr.length) out = fr;
+    return out.length ? { frames: out, fps: fps, rootY: rootY } : null;
+  }
+  TKD3D.clipFor = function (i, classId, rng) {
+    var T = root.TKD || {}, P = T.poses3d, c = null, slug = T.CLASS_SLUGS && T.CLASS_SLUGS[i];
+    if (P) c = P[classId] || (slug && P[slug]) || P[String(classId).replace(/_/g, '-')] || P[i] || null;
+    if (!c && typeof T.generateSequence3D === 'function') { try { c = T.generateSequence3D(i, rng || Math.random, {}); } catch (e) { c = null; } }
+    return asClip(c);
   };
+  TKD3D.sequenceFor = function (i, classId, rng) { var c = TKD3D.clipFor(i, classId, rng); return c ? c.frames : null; };
   TKD3D.has3DPoses = function () { var T = root.TKD || {}; return !!(T.poses3d || typeof T.generateSequence3D === 'function'); };
 })(typeof self !== 'undefined' ? self : this);
