@@ -4,6 +4,9 @@
  * (pause/predict/...) are handled promptly. The held-out eval is also done in chunks across slices.
  * v2: warmup+cosine LR schedule over the global step (TKD.lrSchedule), training-only augmentation (TKD.augment),
  * extra optional fields on ready/status/progress: params, modelBytes, modelName, lr, stepsPerSec, msPerStep, augment.
+ * v2-large: opt-in start {size:'large'} (TKD.NetLarge). One large step is split into micro-batches of LARGE_MICRO samples
+ * spread over several ~8 ms slices (gradients accumulate, then one optimiser update). Refused on phones -> base.
+ * Each size keeps its own IndexedDB weights/history keys ('weights'/'history' vs 'weights-large'/'history-large').
  * Protocol: see CONTRACT.md.
  *   in : start, pause, resume, reset, predict, export, flush (v2), viz (v2)
  *   out: ready, status, progress, eval, saved, prediction, weights, error, resetDone (v2), viz (v2)
@@ -36,6 +39,8 @@
 
   var HISTORY_PROGRESS = 500, HISTORY_EVALS = 2000, SAVE_EVERY = 40, SAVE_MS = 5000, PROGRESS_EVERY = 10, EVAL_SEED = 12345;
   var DEFAULT_LR = 0.006; // v2 peak lr (benchmarked best on waffle-data-2.0; v1 used 0.003)
+  var LARGE_LR = 0.003; // large peak lr (benchmarked: 0.003 > 0.0015 on waffle-data-2.0)
+  var LARGE_MICRO = 2, LARGE_BATCH = 32, LARGE_EVAL_CHUNK = 4;
   var EVAL_CHUNK = 32, REWARM_STEPS = 20; // eval 32 held-out samples per slice; ramp lr over 20 steps after a restore
 
   var S = {
@@ -65,6 +70,7 @@
     nanStreak: 0, lrLowered: false,
     saveChain: Promise.resolve(),
     saving: false, lastSaveT: 0, epoch: 0,
+    size: 'base', sizeRequested: 'base', sizeRefused: false, pend: null,
     vizQueue: [], vizTimer: null, lastVizT: -1e9, vizSnap: null, lastInput: null,
     sliceMs: 8
   };
@@ -73,8 +79,12 @@
   // v2 optional model/perf fields, added to ready / status / progress (additive; v1 pages ignore them)
   function addInfo(m) {
     if (!S.net) return m;
-    m.params = S.net.paramCount(); m.modelBytes = S.net.modelBytes(); m.modelName = TKD.MODEL_NAME || TKD.MODEL_VERSION;
-    m.modelVersion = TKD.MODEL_VERSION; m.lr = S.lr; m.stepsPerSec = S.stepsPerSec; m.msPerStep = S.msPerStep;
+    var large = S.size === 'large';
+    m.size = S.size;
+    m.params = S.net.paramCount(); m.modelBytes = S.net.modelBytes();
+    m.modelName = large ? TKD.MODEL_NAME_LARGE : (TKD.MODEL_NAME || TKD.MODEL_VERSION);
+    m.modelVersion = S.net.version || TKD.MODEL_VERSION;
+    m.batchSize = S.opts ? S.opts.batchSize : undefined; m.lr = S.lr; m.stepsPerSec = S.stepsPerSec; m.msPerStep = S.msPerStep;
     m.augment = !!(S.opts && S.opts.augment);
     return m;
   }
@@ -106,7 +116,19 @@
     return null;
   }
 
-  function newNet(seed) { return new TKD.Net({ seed: seed, channels: 32, hidden: 64, attnDim: 16 }); }
+  function newNet(seed) {
+    if (S.size === 'large') return new TKD.NetLarge({ seed: seed });
+    return new TKD.Net({ seed: seed, channels: 32, hidden: 64, attnDim: 16 });
+  }
+  function keys() { return store.keysFor ? store.keysFor(S.size) : { weights: 'weights', history: 'history' }; }
+  // Large is refused on phones: start {phone:true}, or a mobile UA with <= 4 cores in the worker's navigator.
+  function isPhone(o) {
+    if (o.phone === true) return true;
+    var nav = self.navigator;
+    if (!nav) return false;
+    var hc = nav.hardwareConcurrency, ua = String(nav.userAgent || '');
+    return hc != null && hc <= 4 && /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+  }
 
   function emptyHistory() { return { progress: [], evals: [] }; }
   function validHistory(h) { return h && h.progress && h.progress.length !== undefined && h.evals && h.evals.length !== undefined; }
@@ -136,9 +158,12 @@
       return;
     }
     o = o || {};
+    S.sizeRequested = o.size === 'large' ? 'large' : 'base';
+    S.sizeRefused = S.sizeRequested === 'large' && (isPhone(o) || typeof TKD.NetLarge !== 'function');
+    S.size = S.sizeRequested === 'large' && !S.sizeRefused ? 'large' : 'base';
     S.opts = {
-      batchSize: num(o.batchSize, 1, 512, 64, true),
-      lr: num(o.lr, 1e-6, 0.1, DEFAULT_LR, false),
+      batchSize: num(o.batchSize, 1, 512, S.size === 'large' ? LARGE_BATCH : 64, true),
+      lr: num(o.lr, 1e-6, 0.1, S.size === 'large' ? LARGE_LR : DEFAULT_LR, false),
       evalEvery: num(o.evalEvery, 1, 100000, 25, true),
       evalSize: num(o.evalSize, 9, 5000, 450, true),
       fresh: !!o.fresh,
@@ -146,6 +171,7 @@
     };
     S.phase = 'loading';
     status('loading');
+    if (S.sizeRefused) status('loading', 'large model disabled on this device');
     if (loadErrors.nn) { fatal(loadErrors.nn); return; }
     if (loadErrors.data) { fatal(loadErrors.data); return; }
     var problem;
@@ -157,7 +183,7 @@
       return store.incrementSessions();
     }).then(function (meta) {
       S.sessions = (meta && meta.sessions) || 1;
-      return S.opts.fresh ? null : store.loadWeights();
+      return S.opts.fresh ? null : store.loadWeights(keys().weights, S.size === 'large' ? TKD.MODEL_VERSION_LARGE : TKD.MODEL_VERSION);
     }).then(function (rec) {
       S.net = newNet(1);
       S.step = 0;
@@ -165,7 +191,7 @@
         try { S.net.setWeights(rec.weights); S.step = rec.step || 0; restored = true; }
         catch (e) { S.net = newNet(1); S.step = 0; }
       }
-      return restored ? store.loadHistory() : null;
+      return restored ? store.loadHistory(keys().history) : null;
     }).then(function (h) {
       S.restored = restored;
       S.history = validHistory(h) ? h : emptyHistory();
@@ -176,7 +202,7 @@
       if (p) throw new Error('data.js breaks the contract (test split): ' + p);
       S.evalSet = { x: eb.x, y: eb.y, n: S.opts.evalSize };
       S.phase = 'ready';
-      post(addInfo({ type: 'ready', restored: restored, steps: S.step, sessions: S.sessions, layers: layersInfo() }));
+      post(addInfo({ type: 'ready', restored: restored, steps: S.step, sessions: S.sessions, layers: layersInfo(), sizeRequested: S.sizeRequested, sizeRefused: S.sizeRefused }));
       if (S.pendingReset) { S.pendingReset = false; doReset(); return; }
       if (S.wantPause) { S.running = false; doEval(); status('paused'); return; }
       begin(true);
@@ -209,6 +235,7 @@
   }
 
   function stepOnce() {
+    if (S.size === 'large') { microStep(); return; }
     var bs = S.opts.batchSize;
     var ts = now();
     var b = TKD.generateBatch(bs, S.rng, { split: 'train' }); // fresh data every step
@@ -216,6 +243,35 @@
     S.lr = currentLr();
     var r = S.net.trainBatch(b.x, b.y, bs, S.lr);
     S.trainMs += now() - ts; S.trainSteps++;
+    afterStep(r, bs);
+  }
+
+  // Large: one optimiser step = batchSize samples processed LARGE_MICRO at a time across slices (gradient accumulation).
+  function microStep() {
+    var ts = now(), P = S.pend, bs = S.opts.batchSize, L = S.net.T * S.net.F, O = S.net.O;
+    if (!P) {
+      var b = TKD.generateBatch(bs, S.rng, { split: 'train' });
+      if (S.opts.augment) TKD.augment(b.x, b.y, bs, S.rng);
+      P = S.pend = { x: b.x, y: b.y, pos: 0, seed: Math.floor(S.rng() * 4294967296) >>> 0, loss: 0, acc: 0, bad: false };
+      S.net.zeroGrad();
+    }
+    var m = Math.min(LARGE_MICRO, bs - P.pos);
+    var r = S.net.computeGradients(P.x.subarray(P.pos * L, (P.pos + m) * L), P.y.subarray(P.pos * O, (P.pos + m) * O), m,
+      { accumulate: true, invN: 1 / bs, seed: (P.seed + P.pos * 2654435761) >>> 0 });
+    if (!isFinite(r.loss) || !isFinite(r.objective)) P.bad = true;
+    P.loss += r.loss * m; P.acc += r.acc * m; P.pos += m;
+    var res = null;
+    if (P.pos >= bs) {
+      S.pend = null;
+      S.lr = currentLr();
+      var norm = P.bad ? NaN : S.net.applyGradients(S.lr);
+      res = { loss: isFinite(norm) ? P.loss / bs : NaN, acc: P.acc / bs, gradNorm: norm };
+    }
+    S.trainMs += now() - ts;
+    if (res) { S.trainSteps++; afterStep(res, bs); }
+  }
+
+  function afterStep(r, bs) {
     if (!isFinite(r.loss)) { handleNaN(); return; }
     S.nanStreak = 0;
     S.step++; S.epochSteps++; S.spsSamples += bs;
@@ -229,6 +285,7 @@
       S.spsT = t; S.spsSamples = 0; S.trainMs = 0; S.trainSteps = 0;
       var pm = { type: 'progress', step: S.step, epochSteps: S.epochSteps, loss: r.loss, acc: r.acc,
         lossEMA: S.lossEMA, accEMA: S.accEMA, samplesPerSec: S.samplesPerSec };
+      pm.layers = layersInfo();
       post(addInfo(pm));
       S.history.progress.push({ step: S.step, loss: r.loss, acc: r.acc, lossEMA: S.lossEMA, accEMA: S.accEMA });
       if (S.history.progress.length > HISTORY_PROGRESS) S.history.progress.splice(0, S.history.progress.length - HISTORY_PROGRESS);
@@ -243,6 +300,7 @@
     if (S.lastGood) { try { S.net.setWeights(S.lastGood); } catch (e) { S.net = newNet(99 + S.step); } }
     else S.net = newNet(99 + S.step);
     S.net.resetOptimizer();
+    S.pend = null;
     var msg = 'loss became NaN at step ' + S.step + ': restored last good weights and reset the optimiser';
     if (!S.lrLowered) { S.lrScale *= 0.3; S.lrLowered = true; S.lr = currentLr(); msg += ', learning rate lowered to ' + S.lr.toPrecision(2); }
     status('training', msg);
@@ -257,7 +315,7 @@
   }
   function evalChunk() {
     var J = S.evalJob, E = S.evalSet, O = S.net.O, L = S.net.T * S.net.F;
-    var m = Math.min(EVAL_CHUNK, E.n - J.pos);
+    var m = Math.min(S.size === 'large' ? LARGE_EVAL_CHUNK : EVAL_CHUNK, E.n - J.pos);
     var r = S.net.evaluate(E.x.subarray(J.pos * L, (J.pos + m) * L), E.y.subarray(J.pos * O, (J.pos + m) * O), m);
     J.lossSum += r.loss * m;
     for (var a = 0; a < O; a++) for (var b = 0; b < O; b++) J.confusion[a][b] += r.confusion[a][b];
@@ -302,19 +360,19 @@
       if (flush) post({ type: 'saved', step: S.step, bytes: 0, at: Date.now(), ok: false, flush: true });
       return S.saveChain;
     }
-    var w = S.net.getWeights(), step = S.step, ep = S.epoch;
+    var w = S.net.getWeights(), step = S.step, ep = S.epoch, kk = keys();
     var hist = { progress: S.history.progress.slice(), evals: S.history.evals.slice() };
     S.saving = true;
     S.saveChain = S.saveChain.then(function () {
       if (ep !== S.epoch) return null; // a reset happened since the snapshot: do not resurrect old weights
-      return store.saveWeights(w, step);
+      return store.saveWeights(w, step, kk.weights);
     }).then(function (res) {
       var m = res ? { type: 'saved', step: res.step, bytes: res.bytes, at: res.at, ok: true }
         : { type: 'saved', step: step, bytes: 0, at: Date.now(), ok: false };
       if (flush) m.flush = true;
       m.epoch = ep;
       if ((res || flush) && ep === S.epoch) post(m); // a reset happened meanwhile: the page must not see a stale saved
-      return res && ep === S.epoch ? store.saveHistory(hist) : null;
+      return res && ep === S.epoch ? store.saveHistory(hist, kk.history) : null;
     }).catch(function () { return null; }).then(function () { S.saving = false; });
     return S.saveChain;
   }
@@ -341,7 +399,9 @@
     S.running = false; S.gen++;
     S.resets++; S.epoch = S.resets;
     S.wantPause = false;
-    S.saveChain = S.saveChain.then(function () { return store.clear(); });
+    var sz = S.size;
+    S.saveChain = S.saveChain.then(function () { return store.clear(sz); }); // only this size's weights + history
+    S.pend = null;
     S.net = newNet(1 + S.resets * 7919);
     S.step = 0; S.lastGood = null; S.restored = false;
     S.history = emptyHistory();

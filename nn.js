@@ -638,4 +638,436 @@
 
   TKD.Net = Net;
   TKD._kernels = { linF: linF, linB: linB, dwF: dwF, dwB: dwB, attF: attF, attB: attB, poolB: poolB }; // for tests/benchmarks
+  // =====================================================================================
+  // 'large' model (opt-in, start {size:'large'}). Separate class so the base model is untouched.
+  //   embed: Win*x + bin + pos
+  //   4 pre-norm residual temporal-conv blocks: h += Dropout(ReLU(PW * dwconv_k,d(LN(h)) + pb))   k/d = 5/1, 5/2, 3/4, 3/8
+  //   2 pre-norm transformer encoder layers:  h += Dropout(Wo * MHA_4heads(LN(h)) + bo);  h += Dropout(F2 * ReLU(F1 * LN(h) + f1b) + f2b)
+  //   final LN -> [attention pooling over time, mean over time] (2D) -> Dense(H) ReLU Dropout -> Dense(O) -> softmax
+  // Dropout (inverted, rate 0.1) only when training; masks come from a seed, so a step is reproducible.
+  // =====================================================================================
+  TKD.MODEL_VERSION_LARGE = 'tcn-attn-v2-large';
+  TKD.MODEL_NAME_LARGE = 'TKD-Net v2 large: 4 dilated conv blocks + 2 transformer layers (4 heads)';
+  TKD.MODEL_VERSIONS = { base: TKD.MODEL_VERSION, large: TKD.MODEL_VERSION_LARGE };
+
+  // LayerNorm over the last dim (D) of R rows. Caches xhat and rstd for backward.
+  function lnF(X, g, b, Y, xhat, rstd, R, D) {
+    var invD = 1 / D;
+    for (var r = 0; r < R; r++) {
+      var o = r * D, m = 0, v = 0, d;
+      for (d = 0; d < D; d++) m += X[o + d];
+      m *= invD;
+      for (d = 0; d < D; d++) { var c = X[o + d] - m; v += c * c; }
+      var rs = 1 / Math.sqrt(v * invD + 1e-5);
+      rstd[r] = rs;
+      for (d = 0; d < D; d++) { var xh = (X[o + d] - m) * rs; xhat[o + d] = xh; Y[o + d] = xh * g[d] + b[d]; }
+    }
+  }
+  // Adds d(loss)/dX into dX; accumulates gamma/beta grads.
+  function lnB(dY, g, xhat, rstd, gg, gb, dX, R, D) {
+    var invD = 1 / D;
+    for (var r = 0; r < R; r++) {
+      var o = r * D, m1 = 0, m2 = 0, d;
+      for (d = 0; d < D; d++) {
+        var dy = dY[o + d], xh = xhat[o + d], dyh = dy * g[d];
+        gg[d] += dy * xh; gb[d] += dy;
+        m1 += dyh; m2 += dyh * xh;
+      }
+      m1 *= invD; m2 *= invD;
+      var rs = rstd[r];
+      for (d = 0; d < D; d++) dX[o + d] += rs * (dY[o + d] * g[d] - m1 - xhat[o + d] * m2);
+    }
+  }
+  // Multi-head self-attention core: Out[t][h*DH+a] = sum_u softmax_u(Q_h[t].K_h[u]*scale) V[u][h*DH+a]
+  function mhaF(Q, K, V, P, Out, n, T, D, NH) {
+    var DH = D / NH, scale = 1 / Math.sqrt(DH), TD = T * D, TT = T * T;
+    for (var i = 0; i < n; i++) {
+      var so = i * TD;
+      for (var h = 0; h < NH; h++) {
+        var hs = h * DH, po = (i * NH + h) * TT;
+        for (var t = 0; t < T; t++) {
+          var qt = so + t * D + hs, pr = po + t * T, mx = -Infinity, u, a, s;
+          for (u = 0; u < T; u++) {
+            var ku = so + u * D + hs;
+            s = 0;
+            for (a = 0; a < DH; a++) s += Q[qt + a] * K[ku + a];
+            s *= scale; P[pr + u] = s; if (s > mx) mx = s;
+          }
+          var den = 0;
+          for (u = 0; u < T; u++) { var e = Math.exp(P[pr + u] - mx); P[pr + u] = e; den += e; }
+          var inv = 1 / den;
+          for (u = 0; u < T; u++) P[pr + u] *= inv;
+          var ot = so + t * D + hs;
+          for (a = 0; a < DH; a++) Out[ot + a] = 0;
+          for (u = 0; u < T; u++) {
+            var p = P[pr + u], vu = so + u * D + hs;
+            for (a = 0; a < DH; a++) Out[ot + a] += p * V[vu + a];
+          }
+        }
+      }
+    }
+  }
+  function mhaB(Q, K, V, P, dOut, dQ, dK, dV, dProw, n, T, D, NH) {
+    var DH = D / NH, scale = 1 / Math.sqrt(DH), TD = T * D, TT = T * T;
+    dQ.fill(0, 0, n * TD); dK.fill(0, 0, n * TD); dV.fill(0, 0, n * TD);
+    for (var i = 0; i < n; i++) {
+      var so = i * TD;
+      for (var h = 0; h < NH; h++) {
+        var hs = h * DH, po = (i * NH + h) * TT;
+        for (var t = 0; t < T; t++) {
+          var ot = so + t * D + hs, pr = po + t * T, dot = 0, u, a, s;
+          for (u = 0; u < T; u++) {
+            var vu = so + u * D + hs, p = P[pr + u];
+            s = 0;
+            for (a = 0; a < DH; a++) { var go = dOut[ot + a]; s += go * V[vu + a]; dV[vu + a] += p * go; }
+            dProw[u] = s; dot += p * s;
+          }
+          for (u = 0; u < T; u++) {
+            var ds = P[pr + u] * (dProw[u] - dot) * scale;
+            if (ds === 0) continue;
+            var ku = so + u * D + hs;
+            for (a = 0; a < DH; a++) { dQ[ot + a] += ds * K[ku + a]; dK[ku + a] += ds * Q[ot + a]; }
+          }
+        }
+      }
+    }
+  }
+  // inverted dropout: mask = 0 or 1/(1-p); train=false -> mask 1
+  function dropMask(mask, len, p, rng) {
+    if (!rng || !(p > 0)) { mask.fill(1, 0, len); return; }
+    var keep = 1 / (1 - p);
+    for (var i = 0; i < len; i++) mask[i] = rng() < p ? 0 : keep;
+  }
+
+  var LARGE_CONVS = [{ k: 5, d: 1 }, { k: 5, d: 2 }, { k: 3, d: 4 }, { k: 3, d: 8 }];
+  function NetLarge(opts) {
+    opts = opts || {};
+    var A = this.A = opts.float64 ? Float64Array : Float32Array;
+    var dm = TKD.dims();
+    this.size = 'large';
+    this.version = TKD.MODEL_VERSION_LARGE;
+    this.T = dm.T; this.F = dm.F; this.O = dm.O;
+    var D = this.D = opts.channels || 48;
+    this.NH = opts.heads || 4;
+    if (D % this.NH) throw new Error('channels must be a multiple of heads');
+    this.convs = opts.convs || LARGE_CONVS;
+    this.L = opts.layers == null ? 2 : opts.layers;
+    this.FF = opts.ffn || 2 * D;
+    this.H = opts.hidden || 64;
+    this.pDrop = opts.dropout == null ? 0.1 : opts.dropout;
+    this.labelSmoothing = opts.labelSmoothing == null ? 0.05 : opts.labelSmoothing;
+    this.seed = (opts.seed == null ? 1 : opts.seed) >>> 0;
+    this.weightDecay = opts.weightDecay == null ? 1e-4 : opts.weightDecay;
+    this.clip = opts.clip == null ? 5 : opts.clip;
+    this.beta1 = 0.9; this.beta2 = 0.999; this.eps = 1e-8;
+    var T = this.T, F = this.F, H = this.H, O = this.O, FF = this.FF, self = this, rng = TKD.makeRng(this.seed || 1);
+    function param(name, size, std, decay, fillv) {
+      var w = new A(size), i;
+      if (fillv) for (i = 0; i < size; i++) w[i] = fillv;
+      else if (std > 0) for (i = 0; i < size; i++) w[i] = gaussian(rng) * std;
+      return { name: name, w: w, g: new A(size), m: new A(size), v: new A(size), decay: decay };
+    }
+    var ps = [param('Win', D * F, Math.sqrt(1 / F), true), param('bin', D, 0, false), param('pos', T * D, 0.1, false)], j, l;
+    for (j = 0; j < this.convs.length; j++) {
+      var k = this.convs[j].k;
+      ps.push(param('c' + j + 'g', D, 0, false, 1), param('c' + j + 'b', D, 0, false));
+      ps.push(param('c' + j + 'DW', D * k, Math.sqrt(1 / k), true), param('c' + j + 'PW', D * D, Math.sqrt(1 / D), true), param('c' + j + 'pb', D, 0, false));
+    }
+    for (l = 0; l < this.L; l++) {
+      var e = 'e' + l;
+      ps.push(param(e + 'ag', D, 0, false, 1), param(e + 'ab', D, 0, false));
+      ps.push(param(e + 'Wq', D * D, Math.sqrt(1 / D), true), param(e + 'bq', D, 0, false));
+      ps.push(param(e + 'Wk', D * D, Math.sqrt(1 / D), true)); // no key bias: softmax over keys is invariant to it (its gradient is exactly 0)
+      ps.push(param(e + 'Wv', D * D, Math.sqrt(1 / D), true), param(e + 'bv', D, 0, false));
+      ps.push(param(e + 'Wo', D * D, Math.sqrt(0.5 / D), true), param(e + 'bo', D, 0, false));
+      ps.push(param(e + 'fg', D, 0, false, 1), param(e + 'fb', D, 0, false));
+      ps.push(param(e + 'F1', FF * D, Math.sqrt(2 / D), true), param(e + 'f1b', FF, 0, false));
+      ps.push(param(e + 'F2', D * FF, Math.sqrt(0.5 / FF), true), param(e + 'f2b', D, 0, false));
+    }
+    ps.push(param('og', D, 0, false, 1), param('ob', D, 0, false), param('wp', D, Math.sqrt(1 / D), true));
+    ps.push(param('Wd', H * 2 * D, Math.sqrt(2 / (2 * D)), true), param('bd', H, 0, false));
+    ps.push(param('Wout', O * H, Math.sqrt(1 / H), true), param('bout', O, 0, false));
+    this.params = ps;
+    this.byName = {};
+    ps.forEach(function (p) { self.byName[p.name] = p; });
+    this.t = 0; this.cap = 0;
+    this.dProw = new A(T);
+  }
+
+  NetLarge.prototype._ensure = function (n) {
+    if (n <= this.cap) return;
+    var A = this.A, T = this.T, D = this.D, R = n * T, RD = R * D, C = this.convs.length, L = this.L, j;
+    this.cap = n;
+    function f(len) { return new A(len); }
+    this.S = []; for (j = 0; j < 1 + C + 2 * L; j++) this.S.push(f(RD)); // residual stream states
+    this.cv = [];
+    for (j = 0; j < C; j++) this.cv.push({ xh: f(RD), rs: f(R), a: f(RD), g: f(RD), r: f(RD), m: f(RD) });
+    this.en = [];
+    for (j = 0; j < L; j++) this.en.push({ xhA: f(RD), rsA: f(R), uA: f(RD), Q: f(RD), K: f(RD), V: f(RD), P: f(n * this.NH * T * T),
+      Oc: f(RD), Po: f(RD), mA: f(RD), xhF: f(RD), rsF: f(R), uF: f(RD), f1: f(R * this.FF), f2: f(RD), mF: f(RD) });
+    this.xhO = f(RD); this.rsO = f(R); this.hf = f(RD);
+    this.alpha = f(n * T); this.pool = f(n * 2 * D); this.d1 = f(n * this.H); this.mD = f(n * this.H); this.dd = f(n * this.H);
+    this.probs = f(n * this.O);
+    // backward
+    this.dS = f(RD); this.dT1 = f(RD); this.dT2 = f(RD); this.dQ = f(RD); this.dK = f(RD); this.dV = f(RD); this.dF1 = f(R * this.FF);
+    this.dPool = f(n * 2 * D); this.dDD = f(n * this.H); this.dZ3 = f(n * this.O);
+  };
+
+  // train: apply dropout with masks from makeRng(seed). Returns probs.
+  NetLarge.prototype.forward = function (x, n, train, seed) {
+    var T = this.T, F = this.F, D = this.D, H = this.H, O = this.O, FF = this.FF, C = this.convs.length, L = this.L;
+    if (n == null) n = Math.floor(x.length / (T * F));
+    this._ensure(n);
+    var bn = this.byName, R = n * T, RD = R * D, TD = T * D, i, r, j, l, s;
+    var rng = train && this.pDrop > 0 ? TKD.makeRng(seed >>> 0) : null, p = this.pDrop;
+    this._train = !!rng;
+    var S0 = this.S[0], pos = bn.pos.w;
+    linF(x, bn.Win.w, bn.bin.w, S0, R, F, D);
+    for (i = 0; i < n; i++) { var hb = i * TD; for (r = 0; r < TD; r++) S0[hb + r] += pos[r]; }
+    var si = 0;
+    for (j = 0; j < C; j++) {
+      var cj = this.cv[j], c = 'c' + j, Sin = this.S[si], Sout = this.S[si + 1];
+      lnF(Sin, bn[c + 'g'].w, bn[c + 'b'].w, cj.a, cj.xh, cj.rs, R, D);
+      dwF(cj.a, bn[c + 'DW'].w, cj.g, n, T, D, this.convs[j].k, this.convs[j].d);
+      linF(cj.g, bn[c + 'PW'].w, bn[c + 'pb'].w, cj.r, R, D, D);
+      dropMask(cj.m, RD, p, rng);
+      for (r = 0; r < RD; r++) { s = cj.r[r]; if (s < 0) { s = 0; cj.r[r] = 0; } Sout[r] = Sin[r] + s * cj.m[r]; }
+      si++;
+    }
+    for (l = 0; l < L; l++) {
+      var E = this.en[l], e = 'e' + l, S1 = this.S[si], S2 = this.S[si + 1], S3 = this.S[si + 2];
+      lnF(S1, bn[e + 'ag'].w, bn[e + 'ab'].w, E.uA, E.xhA, E.rsA, R, D);
+      linF(E.uA, bn[e + 'Wq'].w, bn[e + 'bq'].w, E.Q, R, D, D);
+      linF(E.uA, bn[e + 'Wk'].w, null, E.K, R, D, D);
+      linF(E.uA, bn[e + 'Wv'].w, bn[e + 'bv'].w, E.V, R, D, D);
+      mhaF(E.Q, E.K, E.V, E.P, E.Oc, n, T, D, this.NH);
+      linF(E.Oc, bn[e + 'Wo'].w, bn[e + 'bo'].w, E.Po, R, D, D);
+      dropMask(E.mA, RD, p, rng);
+      for (r = 0; r < RD; r++) S2[r] = S1[r] + E.Po[r] * E.mA[r];
+      lnF(S2, bn[e + 'fg'].w, bn[e + 'fb'].w, E.uF, E.xhF, E.rsF, R, D);
+      linF(E.uF, bn[e + 'F1'].w, bn[e + 'f1b'].w, E.f1, R, D, FF);
+      for (r = 0; r < R * FF; r++) if (E.f1[r] < 0) E.f1[r] = 0;
+      linF(E.f1, bn[e + 'F2'].w, bn[e + 'f2b'].w, E.f2, R, FF, D);
+      dropMask(E.mF, RD, p, rng);
+      for (r = 0; r < RD; r++) S3[r] = S2[r] + E.f2[r] * E.mF[r];
+      si += 2;
+    }
+    var Sl = this.S[si], hf = this.hf, wp = bn.wp.w, alpha = this.alpha, pool = this.pool, P2 = 2 * D;
+    lnF(Sl, bn.og.w, bn.ob.w, hf, this.xhO, this.rsO, R, D);
+    for (i = 0; i < n; i++) {
+      var ho = i * TD, ao = i * T, mx = -Infinity, t, d;
+      for (t = 0; t < T; t++) { s = 0; for (d = 0; d < D; d++) s += wp[d] * hf[ho + t * D + d]; alpha[ao + t] = s; if (s > mx) mx = s; }
+      var den = 0;
+      for (t = 0; t < T; t++) { var ex = Math.exp(alpha[ao + t] - mx); alpha[ao + t] = ex; den += ex; }
+      for (t = 0; t < T; t++) alpha[ao + t] /= den;
+      var po = i * P2;
+      for (d = 0; d < P2; d++) pool[po + d] = 0;
+      for (t = 0; t < T; t++) {
+        var at = alpha[ao + t], hr = ho + t * D;
+        for (d = 0; d < D; d++) { pool[po + d] += at * hf[hr + d]; pool[po + D + d] += hf[hr + d] / T; }
+      }
+    }
+    var d1 = this.d1, dd = this.dd, mD = this.mD;
+    linF(pool, bn.Wd.w, bn.bd.w, d1, n, P2, H);
+    dropMask(mD, n * H, p, rng);
+    for (r = 0; r < n * H; r++) { if (d1[r] < 0) d1[r] = 0; dd[r] = d1[r] * mD[r]; }
+    var probs = this.probs;
+    linF(dd, bn.Wout.w, bn.bout.w, probs, n, H, O);
+    for (i = 0; i < n; i++) {
+      var oo = i * O, zm = -Infinity, o;
+      for (o = 0; o < O; o++) if (probs[oo + o] > zm) zm = probs[oo + o];
+      var dn = 0;
+      for (o = 0; o < O; o++) { var eo = Math.exp(probs[oo + o] - zm); probs[oo + o] = eo; dn += eo; }
+      for (o = 0; o < O; o++) probs[oo + o] /= dn;
+    }
+    return probs;
+  };
+
+  NetLarge.prototype._lossAcc = Net.prototype._lossAcc;
+
+  // Forward (train mode, dropout seed) + backward. opts: {accumulate: keep existing grads, invN: 1/total batch, seed}
+  NetLarge.prototype.computeGradients = function (x, y, n, opts) {
+    opts = opts || {};
+    this.forward(x, n, opts.train !== false, opts.seed == null ? 1 : opts.seed);
+    var res = this._lossAcc(y, n);
+    var T = this.T, F = this.F, D = this.D, H = this.H, O = this.O, FF = this.FF, C = this.convs.length, L = this.L;
+    var bn = this.byName, R = n * T, RD = R * D, TD = T * D, P2 = 2 * D, ls = this.labelSmoothing, i, r, j, l, t, d, o;
+    if (!opts.accumulate) for (var q = 0; q < this.params.length; q++) this.params[q].g.fill(0);
+    var invN = opts.invN == null ? 1 / n : opts.invN, probs = this.probs, dZ3 = this.dZ3;
+    for (i = 0; i < n; i++) {
+      var oo = i * O, ysum = 0;
+      for (o = 0; o < O; o++) ysum += y[oo + o];
+      for (o = 0; o < O; o++) dZ3[oo + o] = (probs[oo + o] * ysum - ((1 - ls) * y[oo + o] + ls * ysum / O)) * invN;
+    }
+    var dDD = this.dDD, d1 = this.d1, mD = this.mD;
+    dDD.fill(0, 0, n * H);
+    linB(this.dd, bn.Wout.w, dZ3, bn.Wout.g, bn.bout.g, dDD, n, H, O);
+    for (r = 0; r < n * H; r++) dDD[r] = d1[r] > 0 ? dDD[r] * mD[r] : 0;
+    var dPool = this.dPool;
+    dPool.fill(0, 0, n * P2);
+    linB(this.pool, bn.Wd.w, dDD, bn.Wd.g, bn.bd.g, dPool, n, P2, H);
+    // pooling backward -> dT1 = d hf
+    var hf = this.hf, alpha = this.alpha, wp = bn.wp.w, gwp = bn.wp.g, dHf = this.dT1, dPr = this.dProw;
+    for (i = 0; i < n; i++) {
+      var ho = i * TD, ao = i * T, po = i * P2, dot = 0;
+      for (t = 0; t < T; t++) {
+        var hr = ho + t * D, at = alpha[ao + t], da = 0;
+        for (d = 0; d < D; d++) { var dpa = dPool[po + d]; da += dpa * hf[hr + d]; dHf[hr + d] = at * dpa + dPool[po + D + d] / T; }
+        dPr[t] = da; dot += at * da;
+      }
+      for (t = 0; t < T; t++) {
+        var ds = alpha[ao + t] * (dPr[t] - dot), hr2 = ho + t * D;
+        for (d = 0; d < D; d++) { gwp[d] += ds * hf[hr2 + d]; dHf[hr2 + d] += ds * wp[d]; }
+      }
+    }
+    var dS = this.dS;
+    dS.fill(0, 0, RD);
+    lnB(dHf, bn.og.w, this.xhO, this.rsO, bn.og.g, bn.ob.g, dS, R, D);
+    var si = C + 2 * L, dA = this.dT1, dB = this.dT2;
+    for (l = L - 1; l >= 0; l--) {
+      var E = this.en[l], e = 'e' + l;
+      // FFN: S3 = S2 + f2 * mF
+      for (r = 0; r < RD; r++) dA[r] = dS[r] * E.mF[r];
+      var dF1 = this.dF1;
+      dF1.fill(0, 0, R * FF);
+      linB(E.f1, bn[e + 'F2'].w, dA, bn[e + 'F2'].g, bn[e + 'f2b'].g, dF1, R, FF, D);
+      for (r = 0; r < R * FF; r++) if (!(E.f1[r] > 0)) dF1[r] = 0;
+      dB.fill(0, 0, RD);
+      linB(E.uF, bn[e + 'F1'].w, dF1, bn[e + 'F1'].g, bn[e + 'f1b'].g, dB, R, D, FF);
+      lnB(dB, bn[e + 'fg'].w, E.xhF, E.rsF, bn[e + 'fg'].g, bn[e + 'fb'].g, dS, R, D);
+      // attention: S2 = S1 + Po * mA
+      for (r = 0; r < RD; r++) dA[r] = dS[r] * E.mA[r];
+      dB.fill(0, 0, RD);
+      linB(E.Oc, bn[e + 'Wo'].w, dA, bn[e + 'Wo'].g, bn[e + 'bo'].g, dB, R, D, D);
+      mhaB(E.Q, E.K, E.V, E.P, dB, this.dQ, this.dK, this.dV, this.dProw, n, T, D, this.NH);
+      dA.fill(0, 0, RD);
+      linB(E.uA, bn[e + 'Wq'].w, this.dQ, bn[e + 'Wq'].g, bn[e + 'bq'].g, dA, R, D, D);
+      linB(E.uA, bn[e + 'Wk'].w, this.dK, bn[e + 'Wk'].g, null, dA, R, D, D);
+      linB(E.uA, bn[e + 'Wv'].w, this.dV, bn[e + 'Wv'].g, bn[e + 'bv'].g, dA, R, D, D);
+      lnB(dA, bn[e + 'ag'].w, E.xhA, E.rsA, bn[e + 'ag'].g, bn[e + 'ab'].g, dS, R, D);
+    }
+    for (j = C - 1; j >= 0; j--) {
+      var cj = this.cv[j], c = 'c' + j;
+      for (r = 0; r < RD; r++) dA[r] = cj.r[r] > 0 ? dS[r] * cj.m[r] : 0;
+      dB.fill(0, 0, RD);
+      linB(cj.g, bn[c + 'PW'].w, dA, bn[c + 'PW'].g, bn[c + 'pb'].g, dB, R, D, D);
+      dA.fill(0, 0, RD);
+      dwB(cj.a, bn[c + 'DW'].w, dB, bn[c + 'DW'].g, dA, n, T, D, this.convs[j].k, this.convs[j].d);
+      lnB(dA, bn[c + 'g'].w, cj.xh, cj.rs, bn[c + 'g'].g, bn[c + 'b'].g, dS, R, D);
+    }
+    var gpos = bn.pos.g;
+    for (i = 0; i < n; i++) { var hq = i * TD; for (r = 0; r < TD; r++) gpos[r] += dS[hq + r]; }
+    linB(x, bn.Win.w, dS, bn.Win.g, bn.bin.g, null, R, F, D);
+    return res;
+  };
+
+  NetLarge.prototype.applyGradients = Net.prototype.applyGradients;
+  NetLarge.prototype.resetOptimizer = Net.prototype.resetOptimizer;
+  NetLarge.prototype.paramCount = Net.prototype.paramCount;
+  NetLarge.prototype.modelBytes = Net.prototype.modelBytes;
+  NetLarge.prototype.zeroGrad = function () { for (var q = 0; q < this.params.length; q++) this.params[q].g.fill(0); };
+
+  // Full step on a batch (tests/bench). The worker instead calls computeGradients on micro-batches with accumulate + invN.
+  NetLarge.prototype.trainBatch = function (x, y, n, lr, seed) {
+    if (n == null) n = Math.floor(y.length / this.O);
+    var r = this.computeGradients(x, y, n, { seed: seed == null ? 1 : seed });
+    if (!isFinite(r.loss) || !isFinite(r.objective)) return { loss: NaN, acc: r.acc, gradNorm: NaN };
+    var norm = this.applyGradients(lr == null ? 0.003 : lr);
+    if (!isFinite(norm)) return { loss: NaN, acc: r.acc, gradNorm: norm };
+    return { loss: r.loss, acc: r.acc, gradNorm: norm };
+  };
+
+  NetLarge.prototype.evaluate = function (x, y, n) {
+    if (n == null) n = Math.floor(y.length / this.O);
+    var O = this.O, S = this.T * this.F, chunk = 16, loss = 0, correct = 0;
+    var confusion = [], perTotal = new Array(O), perOk = new Array(O), i, o;
+    for (o = 0; o < O; o++) { confusion.push(new Array(O).fill(0)); perTotal[o] = 0; perOk[o] = 0; }
+    for (var s = 0; s < n; s += chunk) {
+      var m = Math.min(chunk, n - s);
+      var xs = x.subarray ? x.subarray(s * S, (s + m) * S) : x.slice(s * S, (s + m) * S);
+      var ys = y.subarray ? y.subarray(s * O, (s + m) * O) : y.slice(s * O, (s + m) * O);
+      var probs = this.forward(xs, m, false);
+      for (i = 0; i < m; i++) {
+        var oo = i * O, tr = argmax(ys, oo, O), pr = argmax(probs, oo, O);
+        for (o = 0; o < O; o++) if (ys[oo + o] > 0) loss -= ys[oo + o] * Math.log(Math.max(probs[oo + o], 1e-12));
+        confusion[tr][pr]++; perTotal[tr]++;
+        if (tr === pr) { correct++; perOk[tr]++; }
+      }
+    }
+    var perClass = [];
+    for (o = 0; o < O; o++) perClass.push(perTotal[o] ? perOk[o] / perTotal[o] : 0);
+    return { loss: loss / n, acc: correct / n, confusion: confusion, perClass: perClass };
+  };
+  NetLarge.prototype.predict = function (x) {
+    var probs = this.forward(x, 1, false), out = new Float32Array(this.O);
+    for (var o = 0; o < this.O; o++) out[o] = probs[o];
+    return out;
+  };
+  NetLarge.prototype.getWeights = function () {
+    var out = { version: this.version, size: 'large',
+      arch: { name: 'tcn-attn-large', frames: this.T, features: this.F, channels: this.D, convs: this.convs.map(function (c) { return { k: c.k, d: c.d }; }),
+        layers: this.L, heads: this.NH, ffn: this.FF, hidden: this.H, dropout: this.pDrop, classes: this.O } };
+    for (var q = 0; q < this.params.length; q++) out[this.params[q].name] = new Float32Array(this.params[q].w);
+    return out;
+  };
+  NetLarge.prototype.setWeights = function (obj) {
+    if (!obj) throw new Error('setWeights: no weights');
+    if (obj.version !== this.version) throw new Error('setWeights: version mismatch ' + obj.version + ' != ' + this.version);
+    var q, p;
+    for (q = 0; q < this.params.length; q++) {
+      p = this.params[q];
+      var src = obj[p.name];
+      if (!src || src.length !== p.w.length) throw new Error('setWeights: bad shape for ' + p.name);
+      for (var i = 0; i < src.length; i++) if (!isFinite(src[i])) throw new Error('setWeights: non-finite value in ' + p.name);
+    }
+    for (q = 0; q < this.params.length; q++) { p = this.params[q]; p.w.set(obj[p.name]); }
+    this.resetOptimizer();
+  };
+  NetLarge.prototype.layerInfo = function () {
+    var T = this.T, D = this.D, bn = this.byName, out = [], j;
+    function cnt(prefix, names) { var c = 0; names.forEach(function (nm) { c += bn[prefix + nm].w.length; }); return c; }
+    function add(name, shape, weights, extra) {
+      var c = 0; weights.forEach(function (nm) { c += bn[nm].w.length; });
+      var L = { name: name, shape: shape, params: c, weights: weights };
+      if (extra) for (var k in extra) L[k] = extra[k];
+      out.push(L);
+    }
+    add('input', [T, this.F], []);
+    add('embed', [T, D], ['Win', 'bin', 'pos']);
+    for (j = 0; j < this.convs.length; j++) add('conv' + (j + 1), [T, D], ['g', 'b', 'DW', 'PW', 'pb'].map(function (s) { return 'c' + j + s; }), { kernel: this.convs[j].k, dilation: this.convs[j].d });
+    for (j = 0; j < this.L; j++) add('encoder' + (j + 1), [T, D], ['ag', 'ab', 'Wq', 'bq', 'Wk', 'Wv', 'bv', 'Wo', 'bo', 'fg', 'fb', 'F1', 'f1b', 'F2', 'f2b'].map(function (s) { return 'e' + j + s; }), { heads: this.NH, ffn: this.FF });
+    add('pool', [2 * D], ['og', 'ob', 'wp']);
+    add('dense', [this.H], ['Wd', 'bd']);
+    add('output', [this.O], ['Wout', 'bout']);
+    return out;
+  };
+  NetLarge.prototype.visualize = function (x, prev) {
+    var probs = this.forward(x, 1, false), T = this.T, D = this.D, info = this.layerInfo(), bn = this.byName, snap = {}, layers = [];
+    var acts = { input: timeMean(x, T, this.F), embed: timeMean(this.S[0], T, D), pool: this.pool.subarray(0, 2 * D),
+      dense: this.d1.subarray(0, this.H), output: probs.subarray(0, this.O) };
+    var C = this.convs.length, j;
+    for (j = 0; j < C; j++) acts['conv' + (j + 1)] = timeMean(this.S[j + 1], T, D);
+    for (j = 0; j < this.L; j++) acts['encoder' + (j + 1)] = timeMean(this.S[C + 2 * j + 2], T, D);
+    var attn = new Float32Array(T), E = this.en[this.L - 1], NH = this.NH;
+    if (E) for (var h = 0; h < NH; h++) for (var t = 0; t < T; t++) for (var u = 0; u < T; u++) attn[u] += E.P[(h * T + t) * T + u] / (T * NH);
+    info.forEach(function (L) {
+      var a = acts[L.name], sq = 0, dsum = 0, hasPrev = !!(prev && prev[L.name]);
+      var cur = new Float32Array(L.params), o = 0;
+      L.weights.forEach(function (nm) { cur.set(bn[nm].w, o); o += bn[nm].w.length; });
+      for (var i = 0; i < cur.length; i++) { sq += cur[i] * cur[i]; if (hasPrev) dsum += Math.abs(cur[i] - prev[L.name][i]); }
+      snap[L.name] = cur;
+      var outL = { name: L.name, shape: L.shape, params: L.params, activations: downsample(a, 0, a.length, 64),
+        weightDelta: hasPrev && cur.length ? dsum / cur.length : 0, weightNorm: Math.sqrt(sq) };
+      if (L.name === 'encoder' + NetLarge_last(info)) outL.attention = attn;
+      layers.push(outL);
+    });
+    var pr = [], top = 0;
+    for (var o2 = 0; o2 < this.O; o2++) { pr.push(probs[o2]); if (probs[o2] > probs[top]) top = o2; }
+    return { layers: layers, probs: pr, top: top, snapshot: snap };
+  };
+  function NetLarge_last(info) { var k = 0; info.forEach(function (L) { if (/^encoder/.test(L.name)) k++; }); return k; }
+  TKD.NetLarge = NetLarge;
+  TKD._kernels.lnF = lnF; TKD._kernels.lnB = lnB; TKD._kernels.mhaF = mhaF; TKD._kernels.mhaB = mhaB;
+  // Build a net for a size ('base' | 'large'); unknown sizes give base.
+  TKD.makeNet = function (size, opts) { return size === 'large' ? new NetLarge(opts) : new Net(opts); };
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis));

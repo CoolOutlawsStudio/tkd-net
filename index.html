@@ -7,6 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="TKD-Net">
+<meta name="tkd-poses3d" content="">  <!-- set to "poses3d.js" when Waffle's 3D poses ship next to this page; loaded lazily with the 3D layer -->
 <title>TKD-Net · a neural net learning taekwondo</title>
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
@@ -22,7 +23,7 @@
   var TKD = window.TKD = window.TKD || {};
   var handlers = {};
   var bridge = TKD.bridge = {
-    worker: null, mode: 'none',
+    worker: null, mode: 'none', gen: 0,
     on: function (type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
     emit: function (msg) { if (!msg || typeof msg !== 'object') return; var l = handlers[msg.type] || [], i; for (i = 0; i < l.length; i++) { try { l[i](msg); } catch (e) { if (window.console) console.warn('[tkd-ui]', msg.type, e); } } l = handlers['*'] || []; for (i = 0; i < l.length; i++) { try { l[i](msg); } catch (e) {} } },
     send: function (msg) { if (bridge.worker) bridge.worker.postMessage(msg); },
@@ -32,7 +33,9 @@
     reset: function () { bridge.send({ type: 'reset' }); },
     predict: function (id, x) { bridge.send({ type: 'predict', id: id, x: x }); },
     exportWeights: function () { bridge.send({ type: 'export' }); },
-    flush: function () { bridge.send({ type: 'flush' }); }, // v2 worker; v1 ignores unknown types (default: break)
+    flush: function () { bridge.send({ type: 'flush' }); },
+    // v2-large: switching size = terminate this worker and start a new one with start { size } (CONTRACT v2-large)
+    restart: function (opts) { if (bridge.worker && bridge.worker.terminate) bridge.worker.terminate(); bridge.worker = null; bridge.gen++; if (bridge.connect()) bridge.start(opts); }, // v2 worker; v1 ignores unknown types (default: break)
     connect: function () {
       if (/[?&]demo\b/.test(location.search)) { bridge.worker = makeDemoWorker(); bridge.mode = 'demo'; }
       else if (typeof Worker === 'undefined') { bridge.emit({ type: 'noworker' }); return false; }
@@ -41,7 +44,8 @@
         catch (e) { bridge.emit({ type: 'error', message: 'Could not start train-worker.js: ' + e.message }); return false; }
         bridge.worker.onerror = function (e) { bridge.emit({ type: 'error', message: (e && e.message) || 'Worker failed to load (train-worker.js).' }); if (e && e.preventDefault) e.preventDefault(); };
       }
-      bridge.worker.onmessage = function (e) { if (bridge.filter && !bridge.filter(e.data)) return; bridge.emit(e.data); };
+      var gen = ++bridge.gen; // messages from a terminated worker (size switch) are ignored
+      bridge.worker.onmessage = function (e) { if (gen !== bridge.gen) return; if (bridge.filter && !bridge.filter(e.data)) return; bridge.emit(e.data); };
       return true;
     }
   };
@@ -128,12 +132,14 @@
       <div><span>parameters</span><b id="rParams">–</b></div>
       <div><span>steps / s</span><b id="rSteps">–</b></div>
       <div><span>samples / s</span><b id="rSps">–</b></div>
+      <div><span>weights</span><b id="rKB">–</b></div>
       <div><span>step</span><b id="rStep">–</b></div>
+      <div class="size-ro" hidden><span>model</span><b id="rSize">–</b></div>
     </div>
     <div class="net-wrap"><canvas id="netCanvas" role="img" aria-label="Diagram of the network's layers and connections"></canvas></div>
     <p id="netCaption" class="net-caption">Waiting for network data…</p>
     <div class="table-scroll"><table class="layers" aria-label="Layer weight statistics">
-      <thead><tr><th>layer</th><th>shape</th><th>params</th><th>‖W‖</th><th>Δ‖W‖ / step</th></tr></thead>
+      <thead><tr><th>layer</th><th>shape</th><th>params</th><th>‖W‖</th><th id="thDelta">Δ‖W‖ / step</th></tr></thead>
       <tbody id="layerRows"><tr><td colspan="5" class="muted">waiting for network data</td></tr></tbody>
     </table></div>
   </section>
@@ -144,6 +150,13 @@
       <button id="btnPause" class="btn primary" type="button" disabled>Pause</button>
       <button id="btnReset" class="btn" type="button" disabled>Reset</button>
       <button id="btnExport" class="btn" type="button" disabled>Export weights</button>
+    </div>
+    <div id="sizeBox" class="sizebox" hidden>
+      <div class="seg" role="group" aria-label="Model size">
+        <button id="szBase" class="btn" type="button" aria-pressed="true" disabled>Base</button>
+        <button id="szLarge" class="btn" type="button" aria-pressed="false" disabled>Large</button>
+      </div>
+      <p id="sizeNote" class="size-note">Large: about 5× the parameters, much slower steps, more battery; saved separately. Not available with this worker.</p>
     </div>
     <div class="meta">
       <span>step <b id="mStep">0</b></span>
@@ -237,6 +250,11 @@
   function norm(id) { return String(id).toLowerCase().replace(/[\s-]+/g, '_'); }
   function addTech(t) { if (!t || t.id == null) return; var k = norm(t.id); TECH[k] = t; if (t.slug) TECH[norm(t.slug)] = TECH[norm(t.slug)] || t; }
   BUILTIN.forEach(function (b) { addTech({ id: b[0], slug: b[1], english: b[2], korean: b[3] || null, hangul: b[4] || null }); });
+  function addClassInfo() { // data.js v3: TKD.CLASS_SLUGS / CLASS_NAMES / CLASS_KOREAN (index = class id)
+    var C = TKD.CLASSES, S2 = TKD.CLASS_SLUGS; if (!C || !S2) return;
+    for (var i = 0; i < C.length; i++) { var k = norm(C[i]), t = TECH[k]; if (t) { if (S2[i]) t.slug = S2[i]; continue; }
+      addTech({ id: C[i], slug: S2[i] || C[i], english: (TKD.CLASS_NAMES && TKD.CLASS_NAMES[i]) || C[i], korean: (TKD.CLASS_KOREAN && TKD.CLASS_KOREAN[i]) || null }); }
+  }
   function techFor(id) {
     var t = TECH[norm(id)];
     if (t) return t;
@@ -485,7 +503,7 @@
   }
   function findLayer(name) { if (!net.layers) return null; for (var i = 0; i < net.layers.length; i++) if (net.layers[i].name === name) return net.layers[i]; return null; }
   B.on('netinfo', function (m) { ingestNetInfo(m.net || m.info || m); });
-  ['ready', 'status', 'progress', 'eval'].forEach(function (t) { B.on(t, function (m) { if (m.net) ingestNetInfo(m.net); if (m.classes) setClasses(pickClasses(m.classes)); if (isFinite(m.params)) net.params = +m.params; if (isFinite(m.stepsPerSec)) S.workerStepRate = +m.stepsPerSec; if (m.modelName || m.modelVersion) net.modelName = String(m.modelName || m.modelVersion); renderReadouts(); }); });
+  ['ready', 'status', 'progress', 'eval'].forEach(function (t) { B.on(t, function (m) { if (m.net) ingestNetInfo(m.net); if (m.classes) setClasses(pickClasses(m.classes)); if (isFinite(m.params)) net.params = +m.params; if (isFinite(m.stepsPerSec)) S.workerStepRate = +m.stepsPerSec; if (isFinite(m.modelBytes)) net.modelBytes = +m.modelBytes; if (m.modelName || m.modelVersion) net.modelName = String(m.modelName || m.modelVersion); renderReadouts(); }); });
 
   // (b) Real weights via the contract's `export` message: tensor sizes, norms and per-step change.
   function isTA(v) { return v && typeof v === 'object' && ArrayBuffer.isView(v) && typeof v.length === 'number'; }
@@ -510,7 +528,7 @@
       if (copyOK) net.prevW[n] = new Float32Array(a); else delete net.prevW[n];
     });
     net.prevStep = step; net.params = total; net.arch = w.arch || null; net.version = w.version || null; net.tensorNames = names;
-    if (net.source !== 'netinfo') buildLayersFromWeights(w);
+    if (net.source !== 'netinfo' && net.source !== 'viz') buildLayersFromWeights(w);
     computeEdges(w);
     net.staticDirty = true; renderReadouts(); renderLayerTable(); kick();
   });
@@ -574,13 +592,16 @@
     var sr = S.workerStepRate != null ? S.workerStepRate : S.stepRate;
     $('rSteps').textContent = sr == null ? '–' : sr.toFixed(sr < 10 ? 1 : 0);
     $('rSps').textContent = S.sps == null ? '–' : fmtInt(S.sps);
+    $('rKB').textContent = net.modelBytes ? (net.modelBytes / 1024).toFixed(net.modelBytes < 102400 ? 1 : 0) + ' KB' : '–';
     $('rStep').textContent = fmtInt(S.step);
+    if (S.modelSize) { $('rSize').textContent = S.modelSize; document.querySelector('.size-ro').hidden = false; }
     var src = net.source === 'netinfo' ? 'live layer data from the worker' : net.source === 'viz' ? 'live activations from the worker' + (net.modelName ? ' · ' + net.modelName : '') : net.source === 'weights-v1' ? 'real weights · ' + (net.modelName || net.version || 'v1') :
       net.source === 'weights-generic' ? 'real weight tensors · ' + (net.modelName || net.version || 'layout unknown') : bridgeIsDemo() ? 'demo mode: no network data' : 'waiting for network data';
     $('netSource').textContent = src;
   }
   function renderLayerTable() {
     var rows = [], tb = $('layerRows');
+    $('thDelta').textContent = net.source === 'viz' ? 'mean |ΔW| since last' : net.source === 'netinfo' ? 'ΔW' : 'Δ‖W‖ / step';
     if ((net.source === 'netinfo' || net.source === 'viz') && net.layers) {
       net.layers.forEach(function (l) { rows.push([l.name + (l.kind && l.kind !== l.name ? ' (' + l.kind + ')' : ''), l.shape ? l.shape.join('×') : l.units, l.params == null ? '–' : fmtInt(l.params), fmtSci(l.wNorm), fmtSci(l.dW)]); });
     } else if (net.tensorNames) {
@@ -735,6 +756,7 @@
   if (window.IntersectionObserver) new IntersectionObserver(function (es) { viz.netInView = es[0].isIntersecting; }).observe(document.querySelector('.c-net'));
   B.on('viz', function (m) {
     viz.replies++; viz.supported = true;
+    if (m.ready === false) return;
     var src = m.fighters && m.fighters[0] ? m.fighters[0] : m, L = src.layers || (m.net && m.net.layers);
     if (src.probs && src.probs.length) { net.probs = Array.prototype.slice.call(src.probs); net.probsAt = Date.now(); }
     if (L && L.length) {
@@ -764,38 +786,85 @@
       version: net.dataVersion || 0, edges: net.source === 'weights-v1' ? net.edges : null, groups: net.edgeGroups || null,
       values: layerValues, activity: layerActivity };
   }
-  function webglOK() { try { var c = document.createElement('canvas'); return !!(window.WebGLRenderingContext && (c.getContext('webgl2') || c.getContext('webgl'))); } catch (e) { return false; } }
+  // 3D perf guard: no software WebGL by default (SwiftShader/llvmpipe = long main-thread tasks); user can opt in.
+  function gpuInfo() {
+    try {
+      var c = document.createElement('canvas'), o = { failIfMajorPerformanceCaveat: true }, caveat = false;
+      var gl = c.getContext('webgl2', o) || c.getContext('webgl', o);
+      if (!gl) { var c2 = document.createElement('canvas'); gl = c2.getContext('webgl2') || c2.getContext('webgl'); caveat = !!gl; }
+      if (!gl) return { gl: false };
+      var ext = gl.getExtension('WEBGL_debug_renderer_info'), r = String((ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '');
+      var lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
+      return { gl: true, fast: !caveat && !/swiftshader|llvmpipe|softpipe|software|basic render/i.test(r), renderer: r, caveat: caveat };
+    } catch (e) { return { gl: false }; }
+  }
+  function toast(msg) {
+    var t = document.createElement('div'); t.setAttribute('role', 'status'); t.textContent = msg;
+    t.style.cssText = 'position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:50;max-width:min(92vw,520px);padding:10px 14px;border-radius:10px;background:#211b16;border:1px solid #2f2620;color:#f3ead8;font-size:.85rem;box-shadow:0 8px 30px rgba(0,0,0,.6)';
+    document.body.appendChild(t); setTimeout(function () { t.remove(); }, 6500);
+  }
   function loadScript(src) { return new Promise(function (res, rej) { var sc = document.createElement('script'); sc.src = src; sc.async = true; sc.onload = res; sc.onerror = function () { rej(new Error('load ' + src)); }; document.head.appendChild(sc); }); }
-  var three = { state: 'idle' };
+  var three = { state: 'idle', allowSW: false, gpu: null };
   function load3D() {
-    if (three.state !== 'idle' || /[?&]no3d\b/.test(location.search) || !webglOK()) { if (three.state === 'idle') three.state = 'unavailable'; return; }
+    if (three.state !== 'idle') return;
+    if (/[?&]no3d\b/.test(location.search)) { three.state = 'unavailable'; return; }
+    var g = three.gpu = gpuInfo(), btn = $('btn3d');
+    if (!g.gl) { three.state = 'unavailable'; return; }
+    btn.addEventListener('click', function () {
+      if (three.state === 'optin') { three.allowSW = true; fetch3D(true); }
+      else if (three.state === 'ready') set3D(!net.view3d);
+    });
+    if (!g.fast && !/[?&]3d\b/.test(location.search)) {
+      three.state = 'optin'; btn.hidden = false; btn.textContent = 'Enable 3D'; btn.setAttribute('aria-pressed', 'false');
+      btn.title = 'Software graphics detected' + (g.renderer ? ' (' + g.renderer + ')' : '') + ': 3D may be slow here';
+      if (window.console) console.info('[tkd-ui] 2D by default: software WebGL', g.renderer || '(caveat)');
+      return;
+    }
+    if (!g.fast) three.allowSW = true;
+    fetch3D(!reduced);
+  }
+  function fetch3D(turnOn) {
     three.state = 'loading';
     loadScript('assets/vendor/three.min.js').then(function () { return loadScript('assets/rig3d.js'); }).then(function () { return loadScript('assets/net3d.js'); }).then(function () {
       if (!window.THREE || !window.TKD3D || !TKD3D.createNetView) throw new Error('3D scripts incomplete');
-      three.state = 'ready';
-      var btn = $('btn3d'); btn.hidden = false;
-      set3D(!reduced);
-      btn.addEventListener('click', function () { set3D(!net.view3d); });
-      maybeFigure();
-    }).catch(function (e) { three.state = 'failed'; if (window.console) console.info('[tkd-ui] staying in 2D:', e.message); });
+      var pm = document.querySelector('meta[name="tkd-poses3d"]'), psrc = pm && pm.content;
+      if (!(TKD.poses3d || TKD.generateSequence3D) && psrc) return loadScript(psrc).catch(function () {});
+    }).then(function () {
+      three.state = 'ready'; $('btn3d').hidden = false;
+      set3D(turnOn);
+      if (net.view3d) maybeFigure();
+    }).catch(function (e) { three.state = 'failed'; $('btn3d').hidden = true; if (window.console) console.info('[tkd-ui] staying in 2D:', e.message); });
+  }
+  // after 3D starts: ~2 s frame-time probe; if the average frame is > 50 ms, drop to 2D and say so
+  function probe3D() {
+    var n = 0, sum = 0, last = 0, t0 = 0;
+    requestAnimationFrame(function f(t) {
+      if (!net.view3d) return;
+      if (!t0) t0 = t; else { sum += t - last; n++; }
+      last = t;
+      if (t - t0 < 2000 || document.hidden) { requestAnimationFrame(f); return; }
+      if (n && sum / n > 50) { set3D(false); dropFigure(); toast('3D was too slow on this device (' + Math.round(sum / n) + ' ms per frame), so the network is shown in 2D. Tap "3D view" to try again.'); }
+    });
   }
   function set3D(on) {
     var wrap = document.querySelector('.net-wrap'), btn = $('btn3d');
     if (on && !net.view3d) {
-      try { net.view3d = TKD3D.createNetView(wrap, provider3d); } catch (e) { net.view3d = null; three.state = 'failed'; btn.hidden = true; return; }
-      wrap.classList.add('is3d'); net.pulses.length = 0;
+      try { net.view3d = TKD3D.createNetView(wrap, provider3d, { allowSoftware: three.allowSW }); }
+      catch (e) { net.view3d = null; three.state = 'failed'; btn.hidden = true; toast('3D is not available here, so the network is shown in 2D.'); net.staticDirty = true; kick(); return; }
+      wrap.classList.add('is3d'); net.pulses.length = 0; probe3D();
     } else if (!on && net.view3d) { net.view3d.dispose(); net.view3d = null; wrap.classList.remove('is3d'); }
-    btn.textContent = net.view3d ? '2D view' : '3D view'; btn.setAttribute('aria-pressed', net.view3d ? 'true' : 'false');
+    btn.textContent = net.view3d ? '2D view' : '3D view'; btn.setAttribute('aria-pressed', net.view3d ? 'true' : 'false'); btn.title = '';
     net.staticDirty = true; net.layout = null; kick();
   }
+  function dropFigure() { if (!three.fig) return; try { three.fig.dispose && three.fig.dispose(); } catch (e) {} three.fig = null; document.querySelector('.hero-fig').classList.remove('is3d'); }
   // 3D figure in the callout, only if Waffle's 3D poses exist (TKD.poses3d or TKD.generateSequence3D)
   function maybeFigure() {
     if (three.state !== 'ready' || !TKD3D.has3DPoses() || three.fig) return;
-    try { three.fig = TKD3D.createFigureView(document.querySelector('.hero-fig')); } catch (e) { three.fig = null; }
+    try { three.fig = TKD3D.createFigureView(document.querySelector('.hero-fig'), { allowSoftware: three.allowSW }); } catch (e) { three.fig = null; }
   }
   function figureFor(classIndex) {
     if (!three.fig) return false;
-    var seq = TKD3D.sequenceFor(classIndex, CLASSES[classIndex], show.rng);
+    var seq = TKD3D.clipFor(classIndex, CLASSES[classIndex], show.rng);
     var fig = document.querySelector('.hero-fig');
     if (seq) { three.fig.show(seq); fig.classList.add('is3d'); return true; }
     three.fig.hide(); fig.classList.remove('is3d'); return false;
@@ -826,6 +895,51 @@
   window.addEventListener('orientationchange', function () { setTimeout(onResize, 200); });
   document.addEventListener('visibilitychange', function () { if (!document.hidden) { lastT = 0; net.staticDirty = true; lossDirty = true; kick(); } });
 
+
+
+  // ---------- model size selector (Base / Large): desktop only, enabled only when the worker advertises it ----------
+  function isPhone() {
+    var ua = navigator.userAgent || '', coarse = window.matchMedia && matchMedia('(pointer: coarse)').matches, narrow = Math.min(screen.width || 9999, screen.height || 9999) < 700;
+    return /iPhone|iPod|Android.*Mobile|Windows Phone/i.test(ua) || (coarse && narrow);
+  }
+  // Base is always the default (never auto-selected, not remembered across page loads). The selector is enabled only when the
+  // worker reports `size` in `ready` (v2-large). Large needs a confirm; switching terminates the worker and starts a new one.
+  var SZ = { capable: false, busy: false, refused: false, waitFlush: null };
+  var SIZE_HONEST = 'Large has about 5× the parameters and runs far fewer steps per second, so it only pulls ahead over many sessions (and may never on this synthetic data). Each size keeps its own saved weights and curves.';
+  function sizeUI(m) {
+    if (isPhone()) { $('sizeBox').hidden = true; return; } // never offered on phones (the worker also refuses)
+    if (m && (m.size !== undefined || m.sizeRequested !== undefined)) SZ.capable = true;
+    $('sizeBox').hidden = false;
+    var cur = (S.modelSize || 'base').toLowerCase() === 'large' ? 'large' : 'base';
+    $('szBase').setAttribute('aria-pressed', cur === 'base' ? 'true' : 'false'); $('szLarge').setAttribute('aria-pressed', cur === 'large' ? 'true' : 'false');
+    var wired = SZ.capable && B.mode === 'worker' && !SZ.busy;
+    $('szBase').disabled = !wired; $('szLarge').disabled = !wired || SZ.refused;
+    $('sizeNote').textContent = SZ.busy ? 'Saving the current model, then switching…' : SZ.refused ? 'Large model disabled on this device. Running Base.' :
+      SZ.capable ? SIZE_HONEST : 'Large: about 5× the parameters, much slower steps; saved separately. Not available with this worker.';
+  }
+  function clearRunUI() {
+    S.progress = []; S.evals = []; S.lastEval = null; S.step = 0; S.lastProg = null; S.stepRate = null; S.workerStepRate = null; S.sps = null; lossDirty = true;
+    setStat('Train', NaN, null); setStat('Held', NaN, null); $('mSaved').textContent = 'not saved yet'; $('mStep').textContent = 0;
+    buildCM(); buildGallery(); net.prevW = {}; net.prevStep = null; net.source = null; net.params = null; net.modelBytes = null; net.modelName = null;
+    G.ackEpoch = null; clearResetPending(); G.userPaused = false; G.autoPaused = false; // the new worker counts epochs from 0 again
+    renderReadouts(); kick();
+  }
+  function switchSize(sz) {
+    var cur = (S.modelSize || 'base') === 'large' ? 'large' : 'base';
+    if (SZ.busy || sz === cur || !SZ.capable || B.mode !== 'worker') return;
+    if (sz === 'large' && !confirm('Switch to the Large model? It trains much slower and uses more battery, and only beats Base over many sessions. Your Base model stays saved.')) return;
+    SZ.busy = true; SZ.refused = false; sizeUI();
+    var done = false;
+    function go() {
+      if (done) return; done = true; SZ.waitFlush = null;
+      clearRunUI(); S.modelSize = sz; setStatus('loading', 'starting the ' + sz + ' model');
+      Promise.race([loadHistory(sz), new Promise(function (r) { setTimeout(r, 1500); })]).then(function () {
+        B.restart({ size: sz, phone: isPhone() }); SZ.busy = false; sizeUI();
+      });
+    }
+    SZ.waitFlush = go; B.flush(); setTimeout(go, 1500); // save first (flush reply), never wait more than 1.5 s
+  }
+  ['szBase', 'szLarge'].forEach(function (id) { $(id).addEventListener('click', function () { switchSize(id === 'szLarge' ? 'large' : 'base'); }); });
 
   // ---------- reset guard + save-on-leave (QA fixes) ----------
   // After `reset`, drop in-flight progress/eval/status/saved/weights/netinfo until the ack arrives.
@@ -876,6 +990,13 @@
   B.on('noworker', function () { $('noWorker').hidden = false; setStatus('error', 'Web Workers unavailable'); });
   B.on('ready', function (m) {
     readCaps(m);
+    if (m.epoch !== undefined) G.flushSupported = true; // v2 worker (CONTRACT v2: flush + epoch)
+    if (m.layers && m.layers.length && net.source !== 'viz') ingestNetInfo({ layers: m.layers, params: m.params });
+    if (m.size) S.modelSize = String(m.size);
+    if (m.sizeRefused === true) { // asked for large, worker refused: we are on Base; show Base's saved curve
+      SZ.refused = true; S.modelSize = 'base'; S.progress = []; S.evals = []; lossDirty = true; loadHistory('base').then(function () { lossDirty = true; kick(); });
+    }
+    sizeUI(m);
     S.running = true; S.step = m.steps || 0; $('mStep').textContent = S.step;
     if (!m.restored) { S.progress = []; S.evals = []; lossDirty = true; }
     net.prevW = {}; net.prevStep = null; net.lastExport = 0;
@@ -889,6 +1010,7 @@
     S.lastProg = { step: m.step, t: now };
     S.step = m.step; $('mStep').textContent = m.step;
     if (isFinite(m.samplesPerSec)) S.sps = +m.samplesPerSec;
+    if (m.size) S.modelSize = String(m.size);
     var le = isFinite(m.lossEMA) ? m.lossEMA : m.loss; $('lossNow').textContent = isFinite(le) ? (+le).toFixed(3) : '';
     setStat('Train', isFinite(m.accEMA) ? m.accEMA : m.acc, m.step);
     pushProgress(m); renderReadouts(); requestExport();
@@ -898,8 +1020,8 @@
     if (m.confusion && m.confusion.length && m.confusion.length !== CLASSES.length) setClasses(pickClasses(null, m.confusion.length));
     S.lastEval = m; setStat('Held', m.acc, m.step); pushEval(m); renderCM();
   });
-  B.on('saved', function (m) { if (m.flush === true) G.flushSupported = true; });
-  B.on('saved', function (m) { var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + (m.bytes != null ? ' · ' + (m.bytes / 1024).toFixed(0) + ' KB' : '') + ' · ' + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
+  B.on('saved', function (m) { if (m.flush === true) { G.flushSupported = true; if (SZ.waitFlush) SZ.waitFlush(); } if (m.ok === false) { $('mSaved').textContent = 'not saved: storage unavailable in this browser'; } });
+  B.on('saved', function (m) { if (m.ok === false) return; var t = new Date(m.at || Date.now()); $('mSaved').textContent = 'saved step ' + m.step + (m.bytes != null ? ' · ' + (m.bytes / 1024).toFixed(0) + ' KB' : '') + ' · ' + t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); });
   B.on('error', function (m) { setStatus('error', m.message); });
 
   $('btnPause').addEventListener('click', function () { if (S.state === 'paused') { G.userPaused = false; G.autoPaused = false; B.resume(); } else { G.userPaused = true; B.pause(); } });
@@ -911,10 +1033,11 @@
   });
 
   // ---------- boot ----------
-  function loadHistory() {
+  function loadHistory(size) {
     try {
       if (!TKD.store || !TKD.store.loadHistory) return Promise.resolve(null);
-      return Promise.resolve(TKD.store.loadHistory()).then(function (h) {
+      var key = size && TKD.store.keysFor ? TKD.store.keysFor(size).history : undefined; // v2-large store: per-size history
+      return Promise.resolve(key ? TKD.store.loadHistory(key) : TKD.store.loadHistory()).then(function (h) {
         if (!h) return;
         var prog = h.progress || [], ev = h.evals || h.eval || [];
         prog.forEach(function (p) { if (p && p.step != null) pushProgress(p); });
@@ -931,6 +1054,7 @@
       list.forEach(function (t) { addTech({ id: t.id || t.classId, slug: t.slug || t.file, english: t.english, korean: t.korean, hangul: t.hangul, icon: t.icon, skeleton: t.skeleton }); });
     }).catch(function () {});
   }
+  addClassInfo();
   setClasses(pickClasses());
   setStatus('loading'); renderReadouts(); onResize();
   var booted = false;

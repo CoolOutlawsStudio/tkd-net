@@ -1,6 +1,7 @@
 /* TKD-Net store.js (owner: Moneyman)
  * IndexedDB persistence for weights, history and meta. Works in a Web Worker and in a page.
- * DB 'tkd-net', object store 'kv', keys: 'weights', 'history', 'meta'.
+ * DB 'tkd-net', object store 'kv', keys: 'weights', 'history', 'meta' (+ 'weights-large', 'history-large' for the opt-in large model:
+ * every weights/history call takes an optional key so the two sizes never overwrite each other; 'meta' is shared).
  * Every call FAILS SOFT: if IndexedDB is missing, blocked (private mode) or errors, calls resolve null
  * (or false for writes) and TKD.store.available is false. Nothing ever rejects.
  */
@@ -103,28 +104,34 @@
 
   // weights: object from net.getWeights() (typed arrays, stored via structured clone, not JSON).
   // Resolves { step, bytes, at } or null.
-  store.saveWeights = function (weights, step) {
+  store.saveWeights = function (weights, step, key) {
     var at = Date.now();
-    var rec = { version: TKD.MODEL_VERSION, step: step || 0, savedAt: at, weights: weights };
-    return put('weights', rec).then(function (ok) {
+    var rec = { version: (weights && weights.version) || TKD.MODEL_VERSION, step: step || 0, savedAt: at, weights: weights };
+    return put(key || 'weights', rec).then(function (ok) {
       return ok ? { step: rec.step, bytes: weightBytes(weights), at: at } : null;
     }, function () { return null; });
   };
 
   // Resolves { version, step, savedAt, weights } or null. A record from another MODEL_VERSION is deleted and null returned.
   // (If nn.js is not loaded, e.g. page-only use, it returns null without deleting anything.)
-  store.loadWeights = function () {
-    return get('weights').then(function (rec) {
+  // key: 'weights' (default, base model) or 'weights-large'; version: expected MODEL_VERSION (default TKD.MODEL_VERSION).
+  store.loadWeights = function (key, version) {
+    key = key || 'weights';
+    return get(key).then(function (rec) {
       if (!rec || !rec.weights) return null;
-      if (TKD.MODEL_VERSION === undefined) return null;
-      if (rec.version !== TKD.MODEL_VERSION) return del('weights').then(function () { return null; });
+      var want = version || TKD.MODEL_VERSION;
+      if (want === undefined) return null;
+      if (rec.version !== want) return del(key).then(function () { return null; });
       return rec;
     }, function () { return null; });
   };
 
   // history: { progress: [...last 500 progress points], evals: [{step, acc, loss}] }
-  store.saveHistory = function (history) { return put('history', history).catch(function () { return false; }); };
-  store.loadHistory = function () { return get('history').catch(function () { return null; }); };
+  // key: 'history' (default, base model) or 'history-large'
+  store.saveHistory = function (history, key) { return put(key || 'history', history).catch(function () { return false; }); };
+  store.loadHistory = function (key) { return get(key || 'history').catch(function () { return null; }); };
+  // key names for a model size ('base' | 'large')
+  store.keysFor = function (size) { var s = size === 'large' ? '-large' : ''; return { weights: 'weights' + s, history: 'history' + s }; };
 
   store.loadMeta = function () { return get('meta').catch(function () { return null; }); };
 
@@ -141,10 +148,12 @@
   };
 
   // Deletes saved weights and history (keeps the session counter). Resolves true, or null if unavailable.
-  store.clear = function () {
+  // size: 'base' (default) or 'large'; only that size's weights + history are deleted.
+  store.clear = function (size) {
+    var k = store.keysFor(size);
     return store.open().then(function (db) {
       if (!db) return null;
-      return del('weights').then(function (a) { return del('history').then(function (b) { return a && b; }); });
+      return del(k.weights).then(function (a) { return del(k.history).then(function (b) { return a && b; }); });
     }).catch(function () { return null; });
   };
 
