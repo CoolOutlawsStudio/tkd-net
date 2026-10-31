@@ -107,3 +107,26 @@ footer{position:relative;z-index:1;text-align:center;font-size:.72rem;color:var(
 }
 @media (max-width:360px){.clock{min-width:64px}.timer{font-size:1.25rem}.status{padding:0 10px}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* Server mode ("Live from server" vs "In your browser") */
+.mode-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px;padding:6px 6px 6px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel-2);font-size:.82rem;min-height:var(--tap)}
+.mode-bar .mode-txt{flex:1 1 200px;min-width:0}
+.mode-bar b{font-weight:800;margin-right:4px}
+.mode-bar[data-source="server"]{border-color:rgba(63,178,127,.5)}
+.mode-bar[data-source="server"] b{color:var(--ok)}
+.mode-bar[data-source="connecting"] b,.mode-bar[data-source="waking"] b{color:var(--blue-2)}
+.mode-bar .btn{flex:none}
+.server-note{margin:0 0 8px;padding:8px 10px;border-left:3px solid var(--gold);background:rgba(212,162,74,.07);border-radius:6px;font-size:.78rem;color:var(--ink-dim)}
+.shared-note{align-self:center;font-size:.78rem;color:var(--ink-dim);flex:1 1 220px}
+.server-only{display:none}
+html[data-source="server"] .server-only{display:inline}
+html[data-source="server"] .local-only{display:none!important}
+.policy .prow{display:grid;grid-template-columns:7.5em 1fr 3em;gap:6px;align-items:center;font-size:.75rem;margin:2px 0}
+.policy .prow b{display:block;height:8px;border-radius:4px;background:var(--line);overflow:hidden}
+.policy .prow b i{display:block;height:100%}
+.policy #polA .prow b i{background:var(--blue-2)}.policy #polB .prow b i{background:var(--gold)}
+.policy .pcols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:480px){.policy .pcols{grid-template-columns:1fr}}
+
+/* Last save and wins-incl.-practice tiles: long values wrap instead of being cut off */
+#sSaved,#sWinsAll{white-space:normal;overflow:visible;text-overflow:clip;font-size:.92rem;line-height:1.25;overflow-wrap:anywhere}

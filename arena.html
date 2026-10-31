@@ -7,6 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="tkd-poses3d" content="">  <!-- set to "poses3d.js" when Waffle's 3D clips ship next to this page -->
+<meta name="tkd-server-url" content="">  <!-- optional override of TKD_SERVER_URL in arena-view.js, e.g. wss://host/arena; empty = use the built-in TKD_SERVER_URL (add ?server=off for in-browser only) -->
 <title>TKD-Net Arena · two AI fighters learning by self-play</title>
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
@@ -26,24 +27,29 @@
 
 <main>
   <section class="stage-card" aria-label="Live match">
+    <div id="modeBar" class="mode-bar" data-source="browser">
+      <span class="mode-txt" role="status" aria-live="polite"><b id="modeLabel">In your browser</b> <span id="modeState">Training in your browser</span></span>
+      <button id="btnServer" class="btn" type="button" hidden>Try server again</button>
+    </div>
+    <p id="serverNote" class="server-note" hidden></p>
     <div id="demoBanner" class="demo-banner" hidden>DEMO · scripted dummy match for layout testing · no learning, no Elo</div>
     <div class="hud">
       <div class="fighter a">
         <div class="name"><i></i>Blue <small id="aAct">–</small></div>
         <div class="meter health"><span>HP</span><b><i id="aHp"></i></b><em id="aHpN">–</em></div>
         <div class="meter stamina"><span>ST</span><b><i id="aSt"></i></b><em id="aStN">–</em></div>
-        <div class="score"><b id="aPts">0</b> pts · <span id="aWins">0</span> wins</div>
+        <div class="score" title="Points this round · rounds won in the live match"><b id="aPts">0</b> pts · <span id="aWins">0</span> live wins</div>
       </div>
       <div class="clock">
         <div class="round">Round <b id="roundNo">–</b></div>
         <div id="timer" class="timer">60.0</div>
-        <div class="draws"><span id="draws">0</span> draws</div>
+        <div class="draws" title="Drawn rounds in the live match"><span id="draws">0</span> draws</div>
       </div>
       <div class="fighter b">
         <div class="name"><i></i>Gold <small id="bAct">–</small></div>
         <div class="meter health"><span>HP</span><b><i id="bHp"></i></b><em id="bHpN">–</em></div>
         <div class="meter stamina"><span>ST</span><b><i id="bSt"></i></b><em id="bStN">–</em></div>
-        <div class="score"><b id="bPts">0</b> pts · <span id="bWins">0</span> wins</div>
+        <div class="score" title="Points this round · rounds won in the live match"><b id="bPts">0</b> pts · <span id="bWins">0</span> live wins</div>
       </div>
     </div>
     <div id="stage" class="stage">
@@ -52,13 +58,14 @@
       <div id="stageMsg" class="stage-msg">Waiting for the arena…</div>
     </div>
     <div class="controls">
-      <button id="btnPause" class="btn primary" type="button" disabled>Pause</button>
-      <div class="seg" role="group" aria-label="Speed">
+      <button id="btnPause" class="btn primary local-only" type="button" disabled>Pause</button>
+      <div class="seg local-only" role="group" aria-label="Speed">
         <button id="sp1" class="btn" type="button" aria-pressed="true">1×</button>
         <button id="spFast" class="btn" type="button" aria-pressed="false">Fast</button>
       </div>
       <button id="btnCam" class="btn" type="button" hidden>Camera: broadcast</button>
-      <button id="btnReset" class="btn" type="button" disabled>Reset</button>
+      <button id="btnReset" class="btn local-only" type="button" disabled>Reset</button>
+      <span id="sharedNote" class="shared-note server-only">Shared match: everyone watching sees these two fighters. Viewers can watch but not pause, speed up or reset it.</span>
     </div>
   </section>
 
@@ -76,6 +83,7 @@
       <div><span>rounds / s</span><b id="sRps">–</b></div>
       <div><span>sim steps / s</span><b id="sSps">–</b></div>
       <div><span>practice rounds</span><b id="sPractice">–</b></div>
+      <div><span>wins incl. practice (Blue / Gold / draw)</span><b id="sWinsAll">–</b></div>
       <div><span>params (A / B)</span><b id="sParams">–</b></div>
       <div><span>last save</span><b id="sSaved">–</b></div>
     </div>
@@ -83,10 +91,10 @@
       <tbody><tr><th>Blue</th><td id="lA0">–</td><td id="lA1">–</td><td id="lA2">–</td><td id="lA3">–</td></tr>
       <tr><th>Gold</th><td id="lB0">–</td><td id="lB1">–</td><td id="lB2">–</td><td id="lB3">–</td></tr></tbody></table></div>
     <div id="policy" class="policy" hidden><h3>What each fighter is about to do <small>(policy probabilities, live)</small></h3><div class="pcols"><div id="polA"></div><div id="polB"></div></div></div>
-    <label class="toggle"><input id="practice" type="checkbox" checked> Practice rounds in the background</label>
+    <label class="toggle local-only"><input id="practice" type="checkbox" checked> Practice rounds in the background</label>
   </section>
 </main>
-<footer>Two fighters, 60-second rounds, learning by self-play in a web worker on this device · simulation only</footer>
+<footer id="footNote">Two fighters, 60-second rounds, learning by self-play in a web worker on this device · simulation only</footer>
 <script src="arena-view.js"></script>
 </body>
 </html>
